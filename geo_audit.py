@@ -675,9 +675,44 @@ STATUS_META = {"pass": ("PASS", "#16a34a", "#f0fdf4"),
                "fail": ("FAIL", "#dc2626", "#fef2f2")}
 
 
-def build_html(site, brand, checks, data, internal=True):
-    """internal=True  -> working copy: includes the recommended fix for every issue.
-       internal=False -> client copy: findings only, no fixes (that's the paid work)."""
+def render_steps(steps, domain):
+    """Render a remediation guide's step list to HTML.
+
+    Uses a literal replace rather than str.format: the code blocks contain JSON
+    with { } braces, which .format would try to interpret as placeholders.
+    """
+    def sub(s):
+        return s.replace("{domain}", domain)
+
+    out = ""
+    for item in steps:
+        kind = item[0]
+        if kind == "p":
+            out += f'<p class="g-p">{sub(item[1])}</p>'
+        elif kind == "ol":
+            lis = "".join(f"<li>{sub(s)}</li>" for s in item[1])
+            out += f'<ol class="g-ol">{lis}</ol>'
+        elif kind == "ul":
+            lis = "".join(f"<li>{sub(s)}</li>" for s in item[1])
+            out += f'<ul class="g-ul">{lis}</ul>'
+        elif kind == "code":
+            label = item[1]
+            body = (sub(item[2])
+                    .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            out += (f'<div class="g-code"><div class="g-code-bar">{label}</div>'
+                    f'<pre>{body}</pre></div>')
+        elif kind == "note":
+            out += f'<div class="g-note">{sub(item[1])}</div>'
+    return out
+
+
+def build_html(site, brand, checks, data, internal=True, guide=False):
+    """internal=True  -> working copy: includes the short recommended fix per check.
+       internal=False -> client copy: findings only, no fixes.
+       guide=True     -> remediation guide: findings + short fix + full step-by-step
+                         instructions for every issue (a sellable deliverable).
+                         Implies internal-style content but no INTERNAL marker."""
+    show_fix = internal or guide
     total = sum(c.points for c in checks)
     maxi = sum(c.max_points for c in checks)
     score = round(100 * total / maxi) if maxi else 0
@@ -749,7 +784,7 @@ def build_html(site, brand, checks, data, internal=True):
         for i, c in enumerate(shown, 1):
             lbl, col, bg = IMPACT_META[c.impact]
             fixhtml = (f'<div class="fix"><span class="fix-lbl">How to fix</span>{c.fix}</div>'
-                       if (internal and c.fix) else "")
+                       if (show_fix and c.fix) else "")
             out += f"""
             <div class="prio">
               <div class="prio-rank">{i}</div>
@@ -790,7 +825,7 @@ def build_html(site, brand, checks, data, internal=True):
         for c in items:
             lbl, scol, sbg = STATUS_META[c.status]
             fixhtml = (f'<div class="fix"><span class="fix-lbl">How to fix</span>{c.fix}</div>'
-                       if (internal and c.fix) else "")
+                       if (show_fix and c.fix) else "")
             rows += f"""
             <div class="check {c.status}">
               <div class="check-head">
@@ -821,8 +856,54 @@ def build_html(site, brand, checks, data, internal=True):
           {detail_rows(items)}
         </section>"""
 
+    # ---------- remediation guide (guide variant only) ----------
+    remediation = ""
+    if guide and issues:
+        import remediation as R
+        domain = site
+        blocks = ""
+        for i, c in enumerate(issues, 1):
+            steps = R.guide_for(c.name)
+            if not steps:
+                continue
+            lbl, col, bg = IMPACT_META[c.impact]
+            blocks += f"""
+            <section class="g-item">
+              <div class="g-head">
+                <span class="g-num">{i}</span>
+                <span class="impact" style="color:{col};background:{bg};border-color:{col}40">{lbl}</span>
+                <h3>{c.name}</h3>
+              </div>
+              <div class="g-finding"><b>Audit finding:</b> {c.detail}</div>
+              {f'<div class="g-summary"><b>In short:</b> {c.fix}</div>' if c.fix else ''}
+              <div class="g-steps">{render_steps(steps, domain)}</div>
+            </section>"""
+        remediation = f"""
+      <section class="block" style="page-break-before:always">
+        <div class="block-head">
+          <h2>Remediation guide</h2>
+          <div class="block-sub">Step-by-step instructions for every issue found, in priority
+            order. Work top to bottom &mdash; access issues must be resolved before structural
+            or content work has any effect.</div>
+        </div>
+        {blocks}
+      </section>"""
+
     # ---------- closing ----------
-    if internal:
+    if guide:
+        closing = f"""
+      <section class="closing">
+        <h2>After the work is done</h2>
+        <p>Re-run this audit once the fixes are live. The score should move measurably, and the
+        before/after comparison against today's baseline of <b>{score}/100</b> is the clearest
+        evidence the work landed.</p>
+        <p>Then test the engines directly: ask ChatGPT, Perplexity, and Google's AI Mode the
+        questions your customers actually ask, and see whether this business gets named. Allow
+        <b>4&ndash;8 weeks</b> after the changes go live &mdash; AI engines re-crawl and re-index on
+        their own schedule, and nobody can make that happen faster.</p>
+        <p class="cta">Prepared by {brand}.</p>
+      </section>"""
+    elif internal:
         closing = ""
     elif issues:
         n = len(issues)
@@ -848,6 +929,7 @@ def build_html(site, brand, checks, data, internal=True):
 
     internal_tag = ('<div class="internal-tag">INTERNAL COPY &mdash; INCLUDES FIXES &mdash; NOT FOR CLIENT</div>'
                     if internal else '')
+    title = "AI Visibility Audit &amp; Remediation Guide" if guide else "AI Visibility Audit"
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -984,6 +1066,40 @@ def build_html(site, brand, checks, data, internal=True):
   .closing p {{ color:#0c4a6e; margin:0 0 8px; }}
   .closing .cta {{ font-weight:700; margin:10px 0 0; }}
 
+  /* ---------- remediation guide ---------- */
+  .g-item {{ border:1px solid #e2e8f0; border-radius:9px; padding:15px 17px;
+             margin-bottom:12px; page-break-inside:avoid; }}
+  .g-head {{ display:flex; align-items:center; gap:9px; margin-bottom:9px; }}
+  .g-num {{ flex:0 0 22px; height:22px; border-radius:50%; background:#0f172a;
+            color:#fff; font-size:11px; font-weight:800; display:flex;
+            align-items:center; justify-content:center; }}
+  .g-head h3 {{ font-size:14px; color:#0f172a; }}
+  .g-finding {{ background:#f8fafc; border-left:3px solid #94a3b8; padding:7px 11px;
+                border-radius:0 6px 6px 0; color:#475569; margin-bottom:8px; }}
+  .g-finding b {{ color:#334155; }}
+  .g-summary {{ background:#eff6ff; border-left:3px solid #3b82f6; padding:7px 11px;
+                border-radius:0 6px 6px 0; color:#1e3a8a; margin-bottom:10px; }}
+  .g-steps {{ color:#334155; }}
+  .g-p {{ margin:0 0 8px; }}
+  .g-ol, .g-ul {{ margin:0 0 10px; padding-left:20px; }}
+  .g-ol li, .g-ul li {{ margin-bottom:5px; }}
+  .g-ol li::marker {{ font-weight:700; color:#3b82f6; }}
+  .g-ul li::marker {{ color:#94a3b8; }}
+  .g-code {{ background:#0f172a; border-radius:7px; margin:10px 0 12px;
+             overflow:hidden; page-break-inside:avoid; }}
+  .g-code-bar {{ background:#1e293b; color:#94a3b8; font-size:9px; font-weight:700;
+                 letter-spacing:.8px; text-transform:uppercase;
+                 padding:5px 12px; border-bottom:1px solid #334155; }}
+  .g-code pre {{ margin:0; padding:11px 13px; color:#e2e8f0; font-size:9.5px;
+                 line-height:1.65; white-space:pre-wrap; word-break:break-word;
+                 font-family:'Consolas','Courier New',monospace; }}
+  .g-note {{ background:#fffbeb; border:1px solid #fde68a; border-radius:7px;
+             padding:9px 12px; color:#92400e; margin:10px 0; }}
+  .g-steps code {{ background:#f1f5f9; border:1px solid #e2e8f0; border-radius:3px;
+                   padding:0 4px; font-family:'Consolas',monospace; font-size:10px;
+                   color:#0f172a; }}
+  .g-note code {{ background:#fef3c7; border-color:#fde68a; }}
+
   footer {{ margin-top:22px; padding-top:11px; border-top:1px solid #e2e8f0;
             color:#94a3b8; font-size:9px; }}
 </style></head>
@@ -991,7 +1107,7 @@ def build_html(site, brand, checks, data, internal=True):
 <div class="page">
   <div class="cover">
     <div class="brand">{brand}</div>
-    <h1>AI Visibility Audit</h1>
+    <h1>{title}</h1>
     <div class="site">{site} &nbsp;&bull;&nbsp; {date} &nbsp;&bull;&nbsp; {pages} pages analyzed</div>
     <div class="scoreband">
       <div class="donut">
@@ -1038,6 +1154,8 @@ def build_html(site, brand, checks, data, internal=True):
     </div>
     {breakdown}
   </section>
+
+  {remediation}
 
   {closing}
 
@@ -1104,6 +1222,12 @@ def run_audit(url, brand, max_pages, out_base):
         f.write(client_html)
     print(f"  wrote {out_base}-client.html (client)")
 
+    guide_html = build_html(parsed.netloc, brand, checks, data,
+                            internal=False, guide=True)
+    with open(f"{out_base}-guide.html", "w", encoding="utf-8") as f:
+        f.write(guide_html)
+    print(f"  wrote {out_base}-guide.html (remediation guide)")
+
     with open(f"{out_base}.json", "w", encoding="utf-8") as f:
         json.dump({"score": score, "grade": grade, "data": data,
                    "checks": [c.as_dict() for c in checks]}, f, indent=2)
@@ -1114,7 +1238,8 @@ def run_audit(url, brand, max_pages, out_base):
         from weasyprint import HTML
         HTML(string=html).write_pdf(f"{out_base}.pdf")
         HTML(string=client_html).write_pdf(f"{out_base}-client.pdf")
-        print(f"  wrote {out_base}.pdf + {out_base}-client.pdf")
+        HTML(string=guide_html).write_pdf(f"{out_base}-guide.pdf")
+        print(f"  wrote {out_base}.pdf + -client.pdf + -guide.pdf")
         pdf_ok = True
     except ImportError:
         print("  (weasyprint not installed - skipped PDF; HTML reports are complete)")

@@ -255,8 +255,11 @@ def run():
     return redirect(url_for("index"))
 
 
-def _report_path(audit_id, ext, client=False):
-    suffix = "-client" if client else ""
+VARIANT_SUFFIX = {"internal": "", "client": "-client", "guide": "-guide"}
+
+
+def _report_path(audit_id, ext, variant="internal"):
+    suffix = VARIANT_SUFFIX.get(variant, "")
     p = os.path.join(REPORT_DIR, f"{audit_id}{suffix}.{ext}")
     return p if os.path.exists(p) else None
 
@@ -265,7 +268,7 @@ def _report_path(audit_id, ext, client=False):
 @app.route("/report/<int:audit_id>/<variant>")
 @login_required
 def report(audit_id, variant="internal"):
-    p = _report_path(audit_id, "html", client=(variant == "client"))
+    p = _report_path(audit_id, "html", variant)
     if not p:
         abort(404)
     with open(p, encoding="utf-8") as f:
@@ -276,14 +279,14 @@ def report(audit_id, variant="internal"):
 @app.route("/pdf/<int:audit_id>/<variant>")
 @login_required
 def pdf(audit_id, variant="internal"):
-    is_client = variant == "client"
-    p = _report_path(audit_id, "pdf", client=is_client)
+    p = _report_path(audit_id, "pdf", variant)
     if not p:
         abort(404)
     with db() as conn:
         row = conn.execute("SELECT url FROM audits WHERE id=?", (audit_id,)).fetchone()
     site = urlparse(row["url"]).netloc.replace(":", "_") if row else "site"
-    tag = "" if is_client else "-INTERNAL"
+    tag = {"internal": "-INTERNAL", "client": "",
+           "guide": "-remediation-guide"}.get(variant, "")
     return send_file(p, as_attachment=True,
                      download_name=f"ai-visibility-audit-{site}{tag}.pdf")
 
@@ -292,8 +295,8 @@ def pdf(audit_id, variant="internal"):
 @login_required
 def delete(audit_id):
     for ext in ("html", "pdf", "json"):
-        for client in (False, True):
-            p = _report_path(audit_id, ext, client=client)
+        for variant in VARIANT_SUFFIX:
+            p = _report_path(audit_id, ext, variant)
             if p:
                 os.remove(p)
     with _db_lock, db() as conn:
@@ -557,6 +560,9 @@ BASE_CSS = """
   .links.client a:hover { background:#dcfce7; }
   td.links.internal { border-left:2px solid #fde68a; }
   td.links.client { border-left:2px solid #bbf7d0; }
+  .links.guide a { color:#6d28d9; background:#faf5ff; border:1px solid #e9d5ff; }
+  .links.guide a:hover { background:#f3e8ff; }
+  td.links.guide { border-left:2px solid #e9d5ff; }
   .err { color:#dc2626; font-size:12px; }
   .spin { display:inline-block; width:12px; height:12px; border:2px solid #cbd5e1;
           border-top-color:#1d4ed8; border-radius:50%;
@@ -620,6 +626,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
       <tr><th>Site</th><th>Date</th><th>Score</th><th>Status</th>
           <th>Internal <span style="text-transform:none;letter-spacing:0">(with fixes)</span></th>
           <th>Client <span style="text-transform:none;letter-spacing:0">(findings only)</span></th>
+          <th>Guide <span style="text-transform:none;letter-spacing:0">(sellable)</span></th>
           <th></th></tr>
       {% for r in rows %}
       <tr>
@@ -652,6 +659,12 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
             {% if r['pdf'] %}<a href="{{ url_for('pdf', audit_id=r['id'], variant='client') }}">PDF</a>{% endif %}
           {% endif %}
         </td>
+        <td class="links guide">
+          {% if r['status']=='done' %}
+            <a href="{{ url_for('report', audit_id=r['id'], variant='guide') }}" target="_blank">View</a>
+            {% if r['pdf'] %}<a href="{{ url_for('pdf', audit_id=r['id'], variant='guide') }}">PDF</a>{% endif %}
+          {% endif %}
+        </td>
         <td style="text-align:right">
           <form method="post" action="{{ url_for('delete', audit_id=r['id']) }}"
                 onsubmit="return confirm('Delete this audit?')" style="margin:0">
@@ -660,7 +673,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         </td>
       </tr>
       {% endfor %}
-      {% if not rows %}<tr><td colspan="7" style="color:#94a3b8">
+      {% if not rows %}<tr><td colspan="8" style="color:#94a3b8">
         No audits yet. Enter a URL above and click Run Audit.</td></tr>{% endif %}
     </table>
   </div>
