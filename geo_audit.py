@@ -857,6 +857,21 @@ def build_html(site, brand, checks, data, internal=True):
   * {{ box-sizing:border-box; }}
   body {{ font-family:'Segoe UI',Helvetica,Arial,sans-serif; color:#1e293b; margin:0;
          font-size:11px; line-height:1.55; }}
+
+  /* Screen: a centred, boxed sheet on a soft background.
+     Print/PDF: the wrapper collapses so @page margins govern instead. */
+  .page {{ max-width:860px; margin:0 auto; padding:34px 38px 44px;
+           background:#fff; }}
+  @media screen {{
+    body {{ background:#eef1f5; padding:28px 18px; }}
+    .page {{ border-radius:14px; box-shadow:0 1px 3px rgba(15,23,42,.06),
+             0 12px 32px rgba(15,23,42,.10); }}
+  }}
+  @media print {{
+    body {{ background:#fff; padding:0; }}
+    .page {{ max-width:none; margin:0; padding:0; box-shadow:none;
+             border-radius:0; }}
+  }}
   h1,h2,h3 {{ margin:0; }}
 
   /* ---------- cover ---------- */
@@ -897,9 +912,10 @@ def build_html(site, brand, checks, data, internal=True):
                    letter-spacing:1.1px; padding:3px 9px; margin-bottom:9px; }}
 
   /* ---------- category strip ---------- */
-  .strip {{ display:flex; gap:9px; margin-bottom:22px; page-break-inside:avoid; }}
-  .cat-card {{ flex:1; border:1px solid #e2e8f0; border-radius:9px; padding:11px 12px;
-               background:#fff; }}
+  .strip {{ display:flex; gap:9px; margin-bottom:22px; page-break-inside:avoid;
+            flex-wrap:wrap; }}
+  .cat-card {{ flex:1 1 160px; border:1px solid #e2e8f0; border-radius:9px;
+               padding:11px 12px; background:#fff; }}
   .cat-card-name {{ font-size:10.5px; font-weight:700; color:#0f172a;
                     margin-bottom:2px; }}
   .cat-card-q {{ font-size:9px; color:#94a3b8; line-height:1.4; min-height:25px; }}
@@ -972,6 +988,7 @@ def build_html(site, brand, checks, data, internal=True):
             color:#94a3b8; font-size:9px; }}
 </style></head>
 <body>
+<div class="page">
   <div class="cover">
     <div class="brand">{brand}</div>
     <h1>AI Visibility Audit</h1>
@@ -1027,6 +1044,7 @@ def build_html(site, brand, checks, data, internal=True):
   <footer>Prepared by {brand} &nbsp;&bull;&nbsp; {date}. Methodology based on published AI-crawler
   documentation and peer-reviewed GEO research (Princeton / KDD 2024). Findings reflect the
   {pages} pages sampled on the audit date; technical findings apply site-wide.</footer>
+</div>
 </body></html>"""
 
 
