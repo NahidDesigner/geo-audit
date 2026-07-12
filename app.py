@@ -200,15 +200,17 @@ def run():
     return redirect(url_for("index"))
 
 
-def _report_path(audit_id, ext):
-    p = os.path.join(REPORT_DIR, f"{audit_id}.{ext}")
+def _report_path(audit_id, ext, client=False):
+    suffix = "-client" if client else ""
+    p = os.path.join(REPORT_DIR, f"{audit_id}{suffix}.{ext}")
     return p if os.path.exists(p) else None
 
 
 @app.route("/report/<int:audit_id>")
+@app.route("/report/<int:audit_id>/<variant>")
 @login_required
-def report(audit_id):
-    p = _report_path(audit_id, "html")
+def report(audit_id, variant="internal"):
+    p = _report_path(audit_id, "html", client=(variant == "client"))
     if not p:
         abort(404)
     with open(p, encoding="utf-8") as f:
@@ -216,26 +218,29 @@ def report(audit_id):
 
 
 @app.route("/pdf/<int:audit_id>")
+@app.route("/pdf/<int:audit_id>/<variant>")
 @login_required
-def pdf(audit_id):
-    p = _report_path(audit_id, "pdf")
+def pdf(audit_id, variant="internal"):
+    is_client = variant == "client"
+    p = _report_path(audit_id, "pdf", client=is_client)
     if not p:
         abort(404)
     with db() as conn:
         row = conn.execute("SELECT url FROM audits WHERE id=?", (audit_id,)).fetchone()
-    name = "ai-visibility-audit"
-    if row:
-        name = "ai-visibility-audit-" + urlparse(row["url"]).netloc.replace(":", "_")
-    return send_file(p, as_attachment=True, download_name=f"{name}.pdf")
+    site = urlparse(row["url"]).netloc.replace(":", "_") if row else "site"
+    tag = "" if is_client else "-INTERNAL"
+    return send_file(p, as_attachment=True,
+                     download_name=f"ai-visibility-audit-{site}{tag}.pdf")
 
 
 @app.route("/delete/<int:audit_id>", methods=["POST"])
 @login_required
 def delete(audit_id):
     for ext in ("html", "pdf", "json"):
-        p = _report_path(audit_id, ext)
-        if p:
-            os.remove(p)
+        for client in (False, True):
+            p = _report_path(audit_id, ext, client=client)
+            if p:
+                os.remove(p)
     with _db_lock, db() as conn:
         conn.execute("DELETE FROM audits WHERE id=?", (audit_id,))
     return redirect(url_for("index"))
@@ -277,7 +282,14 @@ BASE_CSS = """
   .pill { display:inline-block; font-weight:800; font-size:12px; padding:3px 12px;
           border-radius:20px; color:#fff; }
   .status { font-size:11px; font-weight:700; letter-spacing:.5px; }
-  .links a { color:#1d4ed8; text-decoration:none; font-weight:600; margin-right:10px; }
+  .links a { text-decoration:none; font-weight:600; margin-right:8px;
+             font-size:12px; padding:3px 9px; border-radius:5px; white-space:nowrap; }
+  .links.internal a { color:#b45309; background:#fffbeb; border:1px solid #fde68a; }
+  .links.internal a:hover { background:#fef3c7; }
+  .links.client a { color:#15803d; background:#f0fdf4; border:1px solid #bbf7d0; }
+  .links.client a:hover { background:#dcfce7; }
+  td.links.internal { border-left:2px solid #fde68a; }
+  td.links.client { border-left:2px solid #bbf7d0; }
   .err { color:#dc2626; font-size:12px; }
   .spin { display:inline-block; width:12px; height:12px; border:2px solid #cbd5e1;
           border-top-color:#1d4ed8; border-radius:50%;
@@ -331,7 +343,10 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
   <div class="card">
     <table>
-      <tr><th>Site</th><th>Date</th><th>Score</th><th>Status</th><th></th><th></th></tr>
+      <tr><th>Site</th><th>Date</th><th>Score</th><th>Status</th>
+          <th>Internal <span style="text-transform:none;letter-spacing:0">(with fixes)</span></th>
+          <th>Client <span style="text-transform:none;letter-spacing:0">(findings only)</span></th>
+          <th></th></tr>
       {% for r in rows %}
       <tr>
         <td><strong>{{ r['url'].replace('https://','').replace('http://','') }}</strong></td>
@@ -351,10 +366,16 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
             <div class="err" style="font-weight:400">{{ r['error'][:120] }}</div>
           {% endif %}
         </td>
-        <td class="links">
+        <td class="links internal">
           {% if r['status']=='done' %}
             <a href="{{ url_for('report', audit_id=r['id']) }}" target="_blank">View</a>
             {% if r['pdf'] %}<a href="{{ url_for('pdf', audit_id=r['id']) }}">PDF</a>{% endif %}
+          {% endif %}
+        </td>
+        <td class="links client">
+          {% if r['status']=='done' %}
+            <a href="{{ url_for('report', audit_id=r['id'], variant='client') }}" target="_blank">View</a>
+            {% if r['pdf'] %}<a href="{{ url_for('pdf', audit_id=r['id'], variant='client') }}">PDF</a>{% endif %}
           {% endif %}
         </td>
         <td style="text-align:right">
@@ -365,7 +386,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         </td>
       </tr>
       {% endfor %}
-      {% if not rows %}<tr><td colspan="6" style="color:#94a3b8">
+      {% if not rows %}<tr><td colspan="7" style="color:#94a3b8">
         No audits yet. Enter a URL above and click Run Audit.</td></tr>{% endif %}
     </table>
   </div>

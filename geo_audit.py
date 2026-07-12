@@ -601,7 +601,9 @@ STATUS_META = {"pass": ("PASS", "#16a34a", "#f0fdf4"),
                "fail": ("FAIL", "#dc2626", "#fef2f2")}
 
 
-def build_html(site, brand, checks, data):
+def build_html(site, brand, checks, data, internal=True):
+    """internal=True  -> working copy: includes the recommended fix for every issue.
+       internal=False -> client copy: findings only, no fixes (that's the paid work)."""
     total = sum(c.points for c in checks)
     maxi = sum(c.max_points for c in checks)
     score = round(100 * total / maxi) if maxi else 0
@@ -616,7 +618,7 @@ def build_html(site, brand, checks, data):
         for c in items:
             label, scol, sbg = STATUS_META[c.status]
             fix = (f'<div class="fix"><strong>Recommended fix:</strong> {c.fix}</div>'
-                   if c.fix else "")
+                   if (internal and c.fix) else "")
             rows += f"""
             <div class="check">
               <div class="check-head">
@@ -647,6 +649,34 @@ def build_html(site, brand, checks, data):
     fails = sum(1 for c in checks if c.status == "fail")
     warns = sum(1 for c in checks if c.status == "warn")
     passes = sum(1 for c in checks if c.status == "pass")
+    issues = fails + warns
+
+    if internal:
+        intro_tail = ("Every failed item below includes the concrete fix we recommend.")
+        closing = ""
+    else:
+        intro_tail = ("The findings below show exactly where this site stands today.")
+        n_txt = ("no issues" if issues == 0 else
+                 "1 issue" if issues == 1 else f"{issues} issues")
+        if issues == 0:
+            closing = f"""
+  <div class="closing">
+    <strong>This site is in strong shape for AI search.</strong> Every check passed.
+    Keeping it that way requires ongoing attention as AI engines change how they
+    crawl and cite - {brand} can monitor this and flag regressions before they
+    cost visibility.
+  </div>"""
+        else:
+            closing = f"""
+  <div class="closing">
+    <strong>What happens next.</strong> This audit identified <b>{n_txt}</b> limiting
+    how AI engines find, understand, and cite this website. Each one is fixable, and
+    most can be resolved quickly - but the order matters: crawler access issues must
+    be resolved before content or schema work has any effect.
+    <br><br>
+    {brand} can implement these fixes and re-run this audit to verify the improvement.
+    Contact us to discuss scope and timeline.
+  </div>"""
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -689,6 +719,13 @@ def build_html(site, brand, checks, data):
   .detail {{ margin-top:5px; color:#334155; }}
   .fix {{ margin-top:6px; background:#eff6ff; border-left:3px solid #3b82f6;
           padding:6px 10px; border-radius:0 6px 6px 0; color:#1e3a8a; }}
+  .closing {{ background:#f0f9ff; border:1px solid #bae6fd; border-radius:10px;
+              padding:16px 18px; margin-top:22px; color:#0c4a6e;
+              page-break-inside:avoid; }}
+  .internal-tag {{ display:inline-block; background:#fef2f2; color:#b91c1c;
+                   border:1px solid #fecaca; border-radius:5px; font-size:9px;
+                   font-weight:800; letter-spacing:1px; padding:3px 9px;
+                   margin-bottom:10px; }}
   footer {{ margin-top:26px; padding-top:12px; border-top:1px solid #e2e8f0;
             color:#94a3b8; font-size:10px; }}
 </style></head>
@@ -710,14 +747,17 @@ def build_html(site, brand, checks, data):
   </div>
 
   <div class="summary">
+    {'<div class="internal-tag">INTERNAL - NOT FOR CLIENT</div>' if internal else ''}
     <strong>What this report measures.</strong> AI assistants (ChatGPT, Claude, Perplexity,
     Google AI Overviews) now answer a large share of customer questions directly. This audit
     scores whether those engines can <em>access</em>, <em>understand</em>, and <em>cite</em>
     this website - across crawler access, structured data, content citability, and entity trust
-    signals. Every failed item below includes the concrete fix we recommend.
+    signals. {intro_tail}
   </div>
 
   {cat_html}
+
+  {closing}
 
   <footer>Prepared by {brand}. Methodology based on published AI-crawler documentation and
   peer-reviewed GEO research (Princeton/KDD 2024). Scores reflect the sampled pages on the
@@ -768,11 +808,18 @@ def run_audit(url, brand, max_pages, out_base):
     grade = next(g for t, g, _ in GRADE_BANDS if score >= t)
     print(f"  score: {score}/100 (grade {grade})")
 
-    html = build_html(parsed.netloc, brand, checks, data)
-    html_path = f"{out_base}.html"
-    with open(html_path, "w", encoding="utf-8") as f:
+    # Two versions:
+    #   <base>.html / .pdf         -> internal working copy, includes fixes
+    #   <base>-client.html / .pdf  -> client copy, findings only
+    html = build_html(parsed.netloc, brand, checks, data, internal=True)
+    with open(f"{out_base}.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"  wrote {html_path}")
+    print(f"  wrote {out_base}.html (internal)")
+
+    client_html = build_html(parsed.netloc, brand, checks, data, internal=False)
+    with open(f"{out_base}-client.html", "w", encoding="utf-8") as f:
+        f.write(client_html)
+    print(f"  wrote {out_base}-client.html (client)")
 
     with open(f"{out_base}.json", "w", encoding="utf-8") as f:
         json.dump({"score": score, "grade": grade, "data": data,
@@ -783,10 +830,11 @@ def run_audit(url, brand, max_pages, out_base):
     try:
         from weasyprint import HTML
         HTML(string=html).write_pdf(f"{out_base}.pdf")
-        print(f"  wrote {out_base}.pdf")
+        HTML(string=client_html).write_pdf(f"{out_base}-client.pdf")
+        print(f"  wrote {out_base}.pdf + {out_base}-client.pdf")
         pdf_ok = True
     except ImportError:
-        print("  (weasyprint not installed - skipped PDF; HTML report is complete)")
+        print("  (weasyprint not installed - skipped PDF; HTML reports are complete)")
     except Exception as e:
         print(f"  (PDF generation failed: {e}; HTML report is complete)")
 
