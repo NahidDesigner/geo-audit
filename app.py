@@ -14,6 +14,7 @@ Configuration (environment variables, set by the systemd service):
 """
 
 import ipaddress
+import json
 import os
 import secrets
 import socket
@@ -24,8 +25,8 @@ from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import (Flask, Response, abort, redirect, render_template_string,
-                   request, send_file, session, url_for)
+from flask import (Flask, Response, abort, jsonify, redirect,
+                   render_template_string, request, send_file, session, url_for)
 
 from geo_audit import run_audit
 
@@ -510,6 +511,287 @@ def prospect_delete(pid):
     with _db_lock, db() as conn:
         conn.execute("DELETE FROM prospects WHERE id=?", (pid,))
     return redirect(url_for("prospects_page"))
+
+
+# ----------------------------------------------------------------------------
+# MCP server (Streamable HTTP) - manage the tool from a Claude chat
+# ----------------------------------------------------------------------------
+import mcp_server as MCP
+
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+
+
+def _audit_summary(row):
+    return {"audit_id": row["id"], "url": row["url"], "status": row["status"],
+            "score": row["score"], "grade": row["grade"],
+            "created_at": row["created_at"],
+            **({"error": row["error"]} if row["error"] else {})}
+
+
+def _mcp_call(name, args):
+    """Dispatch one MCP tool call. Returns an MCP tool result dict."""
+
+    if name == "run_audit":
+        url = (args.get("url") or "").strip()
+        if not url:
+            return MCP._fail("A url is required.")
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        if not host_is_public(url):
+            return MCP._fail("That host is not a reachable public website.")
+        brand = (args.get("brand") or DEFAULT_BRAND).strip() or DEFAULT_BRAND
+        max_pages = max(2, min(int(args.get("max_pages") or 8), 15))
+
+        with _db_lock, db() as conn:
+            cur = conn.execute(
+                "INSERT INTO audits (url,brand,max_pages,status,created_at) "
+                "VALUES (?,?,?,?,?)",
+                (url, brand, max_pages, "running",
+                 datetime.now().strftime("%Y-%m-%d %H:%M")))
+            aid = cur.lastrowid
+        # run synchronously: the chat is waiting for the answer
+        try:
+            res = run_audit(url, brand, max_pages,
+                            os.path.join(REPORT_DIR, str(aid)))
+        except Exception as e:
+            with _db_lock, db() as conn:
+                conn.execute("UPDATE audits SET status='error', error=? WHERE id=?",
+                             (str(e)[:400], aid))
+            return MCP._fail(f"Audit failed: {e}")
+        with _db_lock, db() as conn:
+            conn.execute("UPDATE audits SET status='done', score=?, grade=?, pdf=? "
+                         "WHERE id=?", (res["score"], res["grade"],
+                                        int(res["pdf"]), aid))
+
+        with open(os.path.join(REPORT_DIR, f"{aid}.json"), encoding="utf-8") as f:
+            raw = json.load(f)
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        issues = sorted((c for c in raw["checks"] if c["status"] != "pass"),
+                        key=lambda c: (order.get(c.get("impact", "medium"), 2),
+                                       -c["max_points"]))
+        out = {
+            "audit_id": aid, "url": url,
+            "score": res["score"], "grade": res["grade"],
+            "pages_analyzed": res["pages_analyzed"],
+            "summary": {
+                "passed": sum(1 for c in raw["checks"] if c["status"] == "pass"),
+                "needs_work": sum(1 for c in raw["checks"] if c["status"] == "warn"),
+                "failed": sum(1 for c in raw["checks"] if c["status"] == "fail"),
+            },
+            "issues": [{"name": c["name"], "impact": c["impact"],
+                        "status": c["status"], "found": c["detail"],
+                        "fix": c["fix"]} for c in issues],
+        }
+        if PUBLIC_URL:
+            out["reports"] = {
+                "internal": f"{PUBLIC_URL}/report/{aid}",
+                "client": f"{PUBLIC_URL}/report/{aid}/client",
+                "guide": f"{PUBLIC_URL}/report/{aid}/guide",
+            }
+        return MCP._text(json.dumps(out, indent=2))
+
+    if name == "list_audits":
+        limit = max(1, min(int(args.get("limit") or 15), 50))
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT * FROM audits ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return MCP._text(json.dumps([_audit_summary(r) for r in rows], indent=2))
+
+    if name == "get_audit":
+        aid = int(args.get("audit_id") or 0)
+        p = os.path.join(REPORT_DIR, f"{aid}.json")
+        if not os.path.exists(p):
+            return MCP._fail(f"No completed audit with id {aid}.")
+        with open(p, encoding="utf-8") as f:
+            raw = json.load(f)
+        with db() as conn:
+            row = conn.execute("SELECT * FROM audits WHERE id=?", (aid,)).fetchone()
+        out = {"audit_id": aid, "url": row["url"] if row else None,
+               "score": raw["score"], "grade": raw["grade"],
+               "checks": [{"name": c["name"], "category": c["category"],
+                           "status": c["status"], "impact": c.get("impact"),
+                           "points": f"{c['points']}/{c['max_points']}",
+                           "found": c["detail"], "fix": c["fix"],
+                           "why_it_matters": c.get("why", "")}
+                          for c in raw["checks"]]}
+        return MCP._text(json.dumps(out, indent=2))
+
+    if name == "get_report_links":
+        aid = int(args.get("audit_id") or 0)
+        if not PUBLIC_URL:
+            return MCP._fail("PUBLIC_URL is not configured, so links can't be built. "
+                             "Set it to the dashboard's public address.")
+        if not os.path.exists(os.path.join(REPORT_DIR, f"{aid}.html")):
+            return MCP._fail(f"No report for audit {aid}.")
+        return MCP._text(json.dumps({
+            "internal_with_fixes": f"{PUBLIC_URL}/report/{aid}",
+            "client_findings_only": f"{PUBLIC_URL}/report/{aid}/client",
+            "remediation_guide": f"{PUBLIC_URL}/report/{aid}/guide",
+            "client_pdf": f"{PUBLIC_URL}/pdf/{aid}/client",
+            "guide_pdf": f"{PUBLIC_URL}/pdf/{aid}/guide",
+            "note": "These require logging in to the dashboard.",
+        }, indent=2))
+
+    if name == "find_prospects":
+        if not PLACES_OK:
+            return MCP._fail("GOOGLE_PLACES_API_KEY is not configured.")
+        query = (args.get("query") or "").strip()
+        if not query:
+            return MCP._fail("A query is required.")
+        n = max(1, min(int(args.get("max_results") or 10), 60))
+        try:
+            results = P.search_places(query, PLACES_KEY, n)
+        except Exception as e:
+            return MCP._fail(f"Places search failed: {e}")
+        added, skipped = [], 0
+        with _db_lock, db() as conn:
+            for r in results:
+                domain = urlparse(r["website"]).netloc.lower().removeprefix("www.")
+                if not domain:
+                    continue
+                if conn.execute("SELECT 1 FROM prospects WHERE domain=?",
+                                (domain,)).fetchone():
+                    skipped += 1
+                    continue
+                cur = conn.execute(
+                    "INSERT INTO prospects (place_id,name,website,domain,address,"
+                    "status,created_at) VALUES (?,?,?,?,?,?,?)",
+                    (r["place_id"], r["name"], r["website"], domain, r["address"],
+                     "found", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                added.append({"prospect_id": cur.lastrowid, "name": r["name"],
+                              "website": r["website"]})
+        return MCP._text(json.dumps(
+            {"added": len(added), "skipped_duplicates": skipped,
+             "prospects": added}, indent=2))
+
+    if name == "list_prospects":
+        limit = max(1, min(int(args.get("limit") or 20), 100))
+        status = (args.get("status") or "").strip()
+        with db() as conn:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM prospects WHERE status=? ORDER BY id DESC LIMIT ?",
+                    (status, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM prospects ORDER BY id DESC LIMIT ?",
+                    (limit,)).fetchall()
+        return MCP._text(json.dumps([{
+            "prospect_id": r["id"], "name": r["name"], "domain": r["domain"],
+            "status": r["status"], "score": r["score"], "grade": r["grade"],
+            "email": r["email"], "draft_subject": r["email_subject"],
+            **({"error": r["error"]} if r["error"] else {}),
+        } for r in rows], indent=2))
+
+    if name == "process_prospects":
+        ids = args.get("prospect_ids") or []
+        if not ids:
+            with db() as conn:
+                ids = [r["id"] for r in conn.execute(
+                    "SELECT id FROM prospects WHERE status='found' ORDER BY id"
+                ).fetchall()][:25]
+        if not ids:
+            return MCP._fail("No prospects to process.")
+        max_pages = max(2, min(int(args.get("max_pages") or 6), 15))
+        # never auto-send from MCP: drafting only
+        threading.Thread(target=process_batch,
+                         args=([int(i) for i in ids], DEFAULT_BRAND, max_pages, False),
+                         daemon=True).start()
+        return MCP._text(json.dumps({
+            "processing": len(ids), "prospect_ids": ids,
+            "note": "Running in the background: audit -> find email -> draft outreach. "
+                    "This does NOT send email. Poll list_prospects for progress; each "
+                    "prospect takes roughly 30-60 seconds.",
+        }, indent=2))
+
+    if name == "get_prospect_draft":
+        pid = int(args.get("prospect_id") or 0)
+        with db() as conn:
+            r = conn.execute("SELECT * FROM prospects WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return MCP._fail(f"No prospect with id {pid}.")
+        return MCP._text(json.dumps({
+            "prospect_id": r["id"], "name": r["name"], "website": r["website"],
+            "status": r["status"], "score": r["score"], "grade": r["grade"],
+            "to": r["email"], "subject": r["email_subject"], "body": r["email_body"],
+            "sent_at": r["sent_at"],
+        }, indent=2))
+
+    if name == "update_prospect_draft":
+        pid = int(args.get("prospect_id") or 0)
+        with db() as conn:
+            r = conn.execute("SELECT id FROM prospects WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return MCP._fail(f"No prospect with id {pid}.")
+        fields = {}
+        if args.get("subject"):
+            fields["email_subject"] = args["subject"]
+        if args.get("body"):
+            fields["email_body"] = args["body"]
+        if args.get("to"):
+            fields["to_addr"] = args["to"]
+        if not fields:
+            return MCP._fail("Nothing to update.")
+        upd = {}
+        if "email_subject" in fields:
+            upd["email_subject"] = fields["email_subject"]
+        if "email_body" in fields:
+            upd["email_body"] = fields["email_body"]
+        if "to_addr" in fields:
+            upd["email"] = fields["to_addr"]
+        _upd(pid, **upd)
+        return MCP._text(json.dumps({
+            "prospect_id": pid, "updated": list(upd),
+            "note": "Draft saved. Review and send it from the dashboard - "
+                    "sending is not available through this connector.",
+        }, indent=2))
+
+    return MCP._fail(f"Unknown tool: {name}")
+
+
+@app.route("/mcp/<token>", methods=["POST", "GET", "DELETE"])
+def mcp_endpoint(token):
+    """MCP Streamable HTTP endpoint. The secret lives in the path."""
+    if not MCP_TOKEN or not secrets.compare_digest(token, MCP_TOKEN):
+        return Response("Not found", status=404)
+
+    if request.method in ("GET", "DELETE"):
+        # No server-initiated streaming and no sessions to terminate.
+        return Response(status=405)
+
+    msg = request.get_json(silent=True) or {}
+    rid = msg.get("id")
+    method = msg.get("method", "")
+    params = msg.get("params") or {}
+
+    # Notifications carry no id and expect no body.
+    if rid is None and method.startswith("notifications/"):
+        return Response(status=202)
+
+    if method == "initialize":
+        return jsonify(MCP._ok(rid, {
+            "protocolVersion": MCP.PROTOCOL_VERSION,
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "geo-audit", "version": "1.0.0"},
+        }))
+
+    if method == "ping":
+        return jsonify(MCP._ok(rid, {}))
+
+    if method == "tools/list":
+        return jsonify(MCP._ok(rid, {"tools": MCP.TOOLS}))
+
+    if method == "tools/call":
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        try:
+            return jsonify(MCP._ok(rid, _mcp_call(name, args)))
+        except Exception as e:
+            traceback.print_exc()
+            return jsonify(MCP._ok(rid, MCP._fail(f"{type(e).__name__}: {e}")))
+
+    return jsonify(MCP._err(rid, -32601, f"Method not found: {method}"))
 
 
 # ----------------------------------------------------------------------------
