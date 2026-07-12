@@ -1,0 +1,5 @@
+data/
+*.pdf
+*.html
+__pycache__/
+.git/

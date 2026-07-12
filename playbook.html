@@ -1,0 +1,754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GEO Implementation Playbook — Working Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ink:#0B0E14;
+    --panel:#151A23;
+    --panel-2:#1B212C;
+    --line:#262D3A;
+    --green:#7DD3A8;
+    --amber:#F2C55C;
+    --red:#E86A6A;
+    --text:#E8EAED;
+    --muted:#5C6470;
+    --muted-2:#8A929E;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --sans:'Inter',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;background:var(--ink);color:var(--text);
+    font-family:var(--sans);font-size:15px;line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+  }
+  ::selection{background:var(--green);color:var(--ink);}
+
+  /* ---------- shell ---------- */
+  .shell{display:grid;grid-template-columns:220px 1fr;max-width:1240px;margin:0 auto;}
+
+  /* ---------- phase spine (signature) ---------- */
+  .spine{
+    position:sticky;top:0;height:100vh;padding:48px 0 48px 24px;
+    display:flex;flex-direction:column;
+  }
+  .spine-title{
+    font-family:var(--mono);font-size:11px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:28px;
+  }
+  .stations{position:relative;flex:1;}
+  .stations::before{
+    content:"";position:absolute;left:9px;top:6px;bottom:auto;height:calc(100% - 40px);
+    width:1px;background:var(--line);
+  }
+  .station{
+    position:relative;display:block;padding:0 0 26px 30px;
+    text-decoration:none;color:var(--muted);
+  }
+  .station::before{
+    content:"";position:absolute;left:5px;top:6px;width:9px;height:9px;
+    border-radius:50%;background:var(--ink);border:1px solid var(--line);
+    transition:background .2s,border-color .2s,box-shadow .2s;
+  }
+  .station.active::before{background:var(--green);border-color:var(--green);
+    box-shadow:0 0 0 4px rgba(125,211,168,.12);}
+  .station .num{
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+    display:block;color:var(--muted);
+  }
+  .station .nm{font-size:13px;font-weight:600;color:var(--muted-2);transition:color .2s;}
+  .station.active .nm{color:var(--text);}
+  .station.active .num{color:var(--green);}
+  .spine-foot{
+    font-family:var(--mono);font-size:10px;color:var(--muted);
+    border-top:1px solid var(--line);padding-top:14px;line-height:1.7;
+  }
+
+  /* ---------- main ---------- */
+  main{padding:48px 40px 120px;min-width:0;}
+
+  header.hero{border-bottom:1px solid var(--line);padding-bottom:36px;margin-bottom:44px;}
+  .eyebrow{
+    font-family:var(--mono);font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--green);margin-bottom:14px;
+  }
+  h1{
+    font-size:34px;line-height:1.2;margin:0 0 14px;font-weight:700;letter-spacing:-.02em;
+  }
+  .sub{color:var(--muted-2);font-size:16px;max-width:56ch;margin:0;}
+  .law{
+    margin-top:26px;border-left:2px solid var(--green);padding:2px 0 2px 16px;
+    font-size:14px;color:var(--text);max-width:64ch;
+  }
+  .law b{color:var(--green);font-weight:600;}
+
+  .budget{display:flex;gap:0;margin-top:28px;border:1px solid var(--line);border-radius:6px;overflow:hidden;flex-wrap:wrap;}
+  .budget div{flex:1;min-width:110px;padding:12px 16px;border-right:1px solid var(--line);}
+  .budget div:last-child{border-right:0;}
+  .budget .k{font-family:var(--mono);font-size:10px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;}
+  .budget .v{font-size:15px;font-weight:600;margin-top:2px;}
+  .budget .v.hi{color:var(--green);}
+
+  /* ---------- phases ---------- */
+  .phase{padding-top:20px;margin-bottom:64px;scroll-margin-top:24px;}
+  .phase-head{display:flex;align-items:baseline;gap:14px;margin-bottom:8px;}
+  .phase-num{
+    font-family:var(--mono);font-size:12px;font-weight:700;color:var(--green);
+    letter-spacing:.1em;
+  }
+  h2{font-size:24px;margin:0;font-weight:700;letter-spacing:-.01em;}
+  .phase-meta{
+    font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:20px;
+  }
+  .phase-lead{color:var(--muted-2);max-width:66ch;margin:0 0 26px;}
+  .phase-lead strong{color:var(--text);font-weight:600;}
+
+  h3{
+    font-size:16px;margin:32px 0 10px;font-weight:600;
+    display:flex;align-items:center;gap:9px;
+  }
+  h3 .tag{
+    font-family:var(--mono);font-size:10px;font-weight:500;color:var(--muted);
+    border:1px solid var(--line);border-radius:3px;padding:1px 6px;letter-spacing:.06em;
+  }
+  h4{font-size:14px;margin:22px 0 8px;font-weight:600;color:var(--text);}
+  p{margin:0 0 12px;max-width:70ch;}
+  .muted{color:var(--muted-2);}
+  a{color:var(--green);}
+
+  ul,ol{max-width:70ch;padding-left:20px;margin:0 0 14px;}
+  li{margin-bottom:7px;}
+  li::marker{color:var(--muted);}
+
+  /* ---------- code blocks ---------- */
+  .code{
+    position:relative;background:var(--panel);border:1px solid var(--line);
+    border-radius:7px;margin:14px 0 20px;overflow:hidden;
+  }
+  .code-bar{
+    display:flex;justify-content:space-between;align-items:center;
+    padding:8px 12px;background:var(--panel-2);border-bottom:1px solid var(--line);
+  }
+  .code-name{
+    font-family:var(--mono);font-size:11px;color:var(--muted-2);letter-spacing:.03em;
+  }
+  .copy{
+    font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    background:transparent;color:var(--muted);border:1px solid var(--line);
+    border-radius:4px;padding:4px 10px;cursor:pointer;transition:all .15s;
+  }
+  .copy:hover{color:var(--green);border-color:var(--green);}
+  .copy.done{color:var(--ink);background:var(--green);border-color:var(--green);}
+  pre{
+    margin:0;padding:14px 16px;overflow-x:auto;
+    font-family:var(--mono);font-size:12.5px;line-height:1.7;color:#C9D1D9;
+  }
+  pre .c{color:var(--muted);}          /* comment */
+  pre .k{color:#9BB4FF;}               /* key */
+  pre .s{color:var(--green);}          /* string */
+  code.inline{
+    font-family:var(--mono);font-size:12.5px;background:var(--panel);
+    border:1px solid var(--line);border-radius:3px;padding:1px 5px;color:var(--green);
+  }
+
+  /* ---------- callouts ---------- */
+  .warn{
+    border:1px solid rgba(242,197,92,.3);background:rgba(242,197,92,.05);
+    border-radius:7px;padding:14px 16px;margin:18px 0;max-width:70ch;
+  }
+  .warn .lbl{
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--amber);margin-bottom:6px;font-weight:700;
+  }
+  .warn p{margin:0;font-size:14px;}
+  .warn p + p{margin-top:8px;}
+
+  /* ---------- tables ---------- */
+  table{
+    width:100%;border-collapse:collapse;margin:14px 0 22px;font-size:13.5px;
+    border:1px solid var(--line);border-radius:6px;overflow:hidden;
+  }
+  th{
+    text-align:left;font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--muted);font-weight:500;
+    padding:9px 14px;background:var(--panel-2);border-bottom:1px solid var(--line);
+  }
+  td{padding:9px 14px;border-bottom:1px solid var(--line);vertical-align:top;}
+  tr:last-child td{border-bottom:0;}
+  td code{font-family:var(--mono);font-size:12px;color:var(--green);}
+  td .lift{font-family:var(--mono);color:var(--green);font-weight:600;}
+
+  /* ---------- before/after ---------- */
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:16px 0 22px;}
+  .ba > div{border:1px solid var(--line);border-radius:7px;overflow:hidden;background:var(--panel);}
+  .ba .h{
+    font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    padding:8px 14px;border-bottom:1px solid var(--line);background:var(--panel-2);
+  }
+  .ba .bad .h{color:var(--red);}
+  .ba .good .h{color:var(--green);}
+  .ba .body{padding:14px;font-size:13.5px;line-height:1.65;}
+  .ba .body p{margin:0 0 10px;}
+  .ba .body p:last-child{margin:0;}
+  .ba .body .q{font-weight:600;color:var(--text);margin-bottom:6px;}
+  .ba .body .hl{color:var(--green);font-weight:600;}
+  .ba .body em{color:var(--muted);font-style:normal;font-family:var(--mono);font-size:11px;}
+  .ba .body table{margin:8px 0;font-size:12px;}
+  .ba .body th,.ba .body td{padding:5px 8px;}
+  .ba-note{font-size:13px;color:var(--muted-2);max-width:70ch;}
+  .ba-note b{color:var(--green);font-weight:600;}
+
+  /* ---------- checklist ---------- */
+  .check{border:1px solid var(--line);border-radius:7px;padding:6px 4px;margin:14px 0 22px;max-width:70ch;background:var(--panel);}
+  .check label{
+    display:flex;gap:11px;align-items:flex-start;padding:8px 12px;cursor:pointer;
+    font-size:13.5px;border-radius:5px;transition:background .12s;
+  }
+  .check label:hover{background:var(--panel-2);}
+  .check input{
+    appearance:none;width:15px;height:15px;flex:0 0 15px;margin-top:3px;
+    border:1px solid var(--muted);border-radius:3px;cursor:pointer;position:relative;
+    transition:all .15s;
+  }
+  .check input:checked{background:var(--green);border-color:var(--green);}
+  .check input:checked::after{
+    content:"";position:absolute;left:4px;top:1px;width:4px;height:8px;
+    border:solid var(--ink);border-width:0 2px 2px 0;transform:rotate(45deg);
+  }
+  .check input:checked + span{color:var(--muted);text-decoration:line-through;}
+  .check input:focus-visible{outline:2px solid var(--green);outline-offset:2px;}
+
+  /* ---------- bite list ---------- */
+  .bites{border-top:1px solid var(--line);padding-top:32px;margin-top:12px;}
+  .bite{display:flex;gap:14px;margin-bottom:18px;max-width:74ch;}
+  .bite .n{
+    font-family:var(--mono);font-size:11px;color:var(--amber);font-weight:700;
+    flex:0 0 auto;padding-top:2px;
+  }
+  .bite b{display:block;margin-bottom:2px;}
+  .bite p{margin:0;font-size:14px;color:var(--muted-2);}
+
+  :focus-visible{outline:2px solid var(--green);outline-offset:2px;}
+
+  @media (max-width:900px){
+    .shell{grid-template-columns:1fr;}
+    .spine{position:static;height:auto;padding:28px 24px 0;}
+    .stations{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;}
+    .stations::before{display:none;}
+    .station{padding:8px 12px;border:1px solid var(--line);border-radius:5px;white-space:nowrap;}
+    .station::before{display:none;}
+    .station.active{border-color:var(--green);}
+    .spine-foot{display:none;}
+    main{padding:32px 24px 80px;}
+    h1{font-size:27px;}
+    .ba{grid-template-columns:1fr;}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto;}
+    *{transition:none!important;}
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ============ PHASE SPINE ============ -->
+  <nav class="spine" aria-label="Phases">
+    <div class="spine-title">Sequence</div>
+    <div class="stations">
+      <a class="station" href="#p1"><span class="num">PHASE 01</span><span class="nm">Access</span></a>
+      <a class="station" href="#p2"><span class="num">PHASE 02</span><span class="nm">Readability</span></a>
+      <a class="station" href="#p3"><span class="num">PHASE 03</span><span class="nm">Citability</span></a>
+      <a class="station" href="#p4"><span class="num">PHASE 04</span><span class="nm">Proof</span></a>
+      <a class="station" href="#pricing"><span class="num">—</span><span class="nm">Pricing</span></a>
+      <a class="station" href="#bites"><span class="num">—</span><span class="nm">What bites</span></a>
+    </div>
+    <div class="spine-foot">
+      Phases are a dependency<br>chain, not a menu.<br>
+      <span style="color:var(--green)">P1 gates everything.</span>
+    </div>
+  </nav>
+
+  <!-- ============ MAIN ============ -->
+  <main>
+    <header class="hero">
+      <div class="eyebrow">Delivery Playbook</div>
+      <h1>The audit found the problems.<br>Here's how you fix them.</h1>
+      <p class="sub">Everything you paste, in the order that matters, for a WordPress site.</p>
+
+      <div class="law">
+        <b>The rule that governs everything:</b> fixes are ordered by leverage, not by report order.
+        A site ChatGPT cannot crawl will never be cited — no matter how perfect its schema is.
+        Phase 1 first, on every client, always.
+      </div>
+
+      <div class="budget">
+        <div><div class="k">Phase 1</div><div class="v hi">30 min</div></div>
+        <div><div class="k">Phase 2</div><div class="v">1–2 hrs</div></div>
+        <div><div class="k">Phase 3</div><div class="v">3–6 hrs</div></div>
+        <div><div class="k">Phase 4</div><div class="v">1 hr</div></div>
+        <div><div class="k">Total / 10-pg site</div><div class="v">~1 day</div></div>
+      </div>
+    </header>
+
+    <!-- ============ PHASE 1 ============ -->
+    <section class="phase" id="p1">
+      <div class="phase-head">
+        <span class="phase-num">PHASE 01</span>
+        <h2>Access</h2>
+      </div>
+      <div class="phase-meta">FIXES: "AI crawlers allowed in robots.txt" · "CDN bot-blocking risk" · "Content readable without JavaScript"</div>
+      <p class="phase-lead">
+        If AI crawlers can't fetch the site, the client is <strong>permanently invisible</strong> to that engine.
+        This is binary — there's no partial credit. It's also the highest-leverage fix you will ever make,
+        and it takes ten minutes.
+      </p>
+
+      <h3>Unblock AI crawlers <span class="tag">robots.txt</span></h3>
+      <p class="muted">WordPress path: <code class="inline">Yoast SEO → Tools → File Editor</code> or <code class="inline">RankMath → General Settings → Edit robots.txt</code>. Replace any AI-bot <code class="inline">Disallow</code> blocks with this:</p>
+
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">robots.txt</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre><span class="c"># AI answer engines — allow</span>
+User-agent: GPTBot
+Allow: /
+
+User-agent: OAI-SearchBot
+Allow: /
+
+User-agent: ChatGPT-User
+Allow: /
+
+User-agent: ClaudeBot
+Allow: /
+
+User-agent: Claude-User
+Allow: /
+
+User-agent: PerplexityBot
+Allow: /
+
+User-agent: Perplexity-User
+Allow: /
+
+User-agent: Google-Extended
+Allow: /
+
+User-agent: *
+Allow: /
+
+Sitemap: https://CLIENTSITE.com/sitemap_index.xml</pre>
+      </div>
+
+      <div class="warn">
+        <div class="lbl">Ask the client — don't decide for them</div>
+        <p>Allowing <code class="inline">GPTBot</code> and <code class="inline">Google-Extended</code> also permits their content to be used for model <em>training</em>, not just retrieval. Most local businesses want the visibility and don't care. Some publishers object.</p>
+        <p>If they want retrieval without training: allow <code class="inline">OAI-SearchBot</code> and <code class="inline">ChatGPT-User</code>, disallow <code class="inline">GPTBot</code>. This reduces reach — tell them so plainly.</p>
+      </div>
+
+      <h3>Fix Cloudflare <span class="tag">the silent killer</span></h3>
+      <p>Cloudflare changed its defaults to block AI crawlers. A site can allow every bot in robots.txt and <strong>still be blocked at the network layer</strong>. The owner has no idea. Your robots.txt fix does nothing if this isn't also fixed.</p>
+      <p class="muted">Cloudflare dashboard → <b>Security → Bots → AI Scrapers and Crawlers</b> → turn OFF "Block AI bots". Menu naming shifts; look for AI bot / AI Scrapers settings. Also check <b>Security → WAF</b> for custom rules blocking bot user-agents.</p>
+
+      <h4>Verify it actually worked</h4>
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">terminal — expect HTTP/2 200, not 403</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre>curl -A <span class="s">"GPTBot"</span> -I https://clientsite.com/
+curl -A <span class="s">"ClaudeBot"</span> -I https://clientsite.com/
+curl -A <span class="s">"PerplexityBot"</span> -I https://clientsite.com/</pre>
+      </div>
+      <p class="muted">A <code class="inline">403</code> means still blocked — go back to Cloudflare. Screenshot the <code class="inline">200</code> responses; it's excellent proof-of-work for the client.</p>
+
+      <h3>JavaScript rendering</h3>
+      <p>Most AI crawlers <strong>do not execute JavaScript</strong>. If content only exists after JS runs, it's invisible. Standard WordPress/Elementor passes fine. Usual culprits when it fails: a JS-driven tab/accordion hiding real content, or aggressive lazy-load.</p>
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">terminal — is the headline in the raw HTML?</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre>curl -s https://clientsite.com/ | grep -i <span class="s">"your headline text"</span></pre>
+      </div>
+      <p class="muted">No match = AI can't see it. Fix by ensuring content renders server-side.</p>
+    </section>
+
+    <!-- ============ PHASE 2 ============ -->
+    <section class="phase" id="p2">
+      <div class="phase-head">
+        <span class="phase-num">PHASE 02</span>
+        <h2>Machine readability</h2>
+      </div>
+      <div class="phase-meta">FIXES: JSON-LD · Organization schema · FAQPage schema · Article schema · canonical + meta · sitemap · llms.txt</div>
+      <p class="phase-lead">The engines can now <em>reach</em> the site. This phase makes them <strong>understand</strong> it.</p>
+
+      <h3>Organization / LocalBusiness schema <span class="tag">site-wide</span></h3>
+      <p class="muted">Paste into <code class="inline">Elementor → Site Settings → Custom Code</code> (location: <code class="inline">&lt;head&gt;</code>), or use Insert Headers and Footers.</p>
+
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">JSON-LD — Organization / LocalBusiness</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre>&lt;script type="application/ld+json"&gt;
+{
+  <span class="k">"@context"</span>: <span class="s">"https://schema.org"</span>,
+  <span class="k">"@type"</span>: <span class="s">"LegalService"</span>,
+  <span class="k">"name"</span>: <span class="s">"Dean Law Firm"</span>,
+  <span class="k">"description"</span>: <span class="s">"Estate planning and business conflict resolution attorneys serving Ocala, Florida."</span>,
+  <span class="k">"url"</span>: <span class="s">"https://deanfirm.com"</span>,
+  <span class="k">"logo"</span>: <span class="s">"https://deanfirm.com/wp-content/uploads/logo.png"</span>,
+  <span class="k">"image"</span>: <span class="s">"https://deanfirm.com/wp-content/uploads/office.jpg"</span>,
+  <span class="k">"telephone"</span>: <span class="s">"+1-352-555-0100"</span>,
+  <span class="k">"priceRange"</span>: <span class="s">"$$"</span>,
+  <span class="k">"address"</span>: {
+    <span class="k">"@type"</span>: <span class="s">"PostalAddress"</span>,
+    <span class="k">"streetAddress"</span>: <span class="s">"123 Main Street, Suite 200"</span>,
+    <span class="k">"addressLocality"</span>: <span class="s">"Ocala"</span>,
+    <span class="k">"addressRegion"</span>: <span class="s">"FL"</span>,
+    <span class="k">"postalCode"</span>: <span class="s">"34470"</span>,
+    <span class="k">"addressCountry"</span>: <span class="s">"US"</span>
+  },
+  <span class="k">"geo"</span>: {
+    <span class="k">"@type"</span>: <span class="s">"GeoCoordinates"</span>,
+    <span class="k">"latitude"</span>: 29.1872,
+    <span class="k">"longitude"</span>: -82.1401
+  },
+  <span class="k">"areaServed"</span>: [
+    { <span class="k">"@type"</span>: <span class="s">"City"</span>, <span class="k">"name"</span>: <span class="s">"Ocala"</span> },
+    { <span class="k">"@type"</span>: <span class="s">"City"</span>, <span class="k">"name"</span>: <span class="s">"Gainesville"</span> }
+  ],
+  <span class="k">"openingHoursSpecification"</span>: [{
+    <span class="k">"@type"</span>: <span class="s">"OpeningHoursSpecification"</span>,
+    <span class="k">"dayOfWeek"</span>: [<span class="s">"Monday"</span>,<span class="s">"Tuesday"</span>,<span class="s">"Wednesday"</span>,<span class="s">"Thursday"</span>,<span class="s">"Friday"</span>],
+    <span class="k">"opens"</span>: <span class="s">"09:00"</span>,
+    <span class="k">"closes"</span>: <span class="s">"17:00"</span>
+  }],
+  <span class="k">"sameAs"</span>: [
+    <span class="s">"https://www.facebook.com/deanfirm"</span>,
+    <span class="s">"https://www.linkedin.com/company/deanfirm"</span>,
+    <span class="s">"https://www.google.com/maps/place/..."</span>
+  ]
+}
+&lt;/script&gt;</pre>
+      </div>
+
+      <h4>Change <code class="inline">@type</code> to match the business</h4>
+      <p class="muted">This is how the engine categorizes them. It matters.</p>
+      <table>
+        <tr><th>Business</th><th>@type</th></tr>
+        <tr><td>Law firm</td><td><code>LegalService</code> or <code>Attorney</code></td></tr>
+        <tr><td>Medical / dental</td><td><code>MedicalBusiness</code> / <code>Dentist</code></td></tr>
+        <tr><td>Restaurant</td><td><code>Restaurant</code></td></tr>
+        <tr><td>Contractor, duct cleaning, roofing</td><td><code>HomeAndConstructionBusiness</code></td></tr>
+        <tr><td>Accountant</td><td><code>AccountingService</code></td></tr>
+        <tr><td>E-commerce</td><td><code>OnlineStore</code></td></tr>
+        <tr><td>Anything else local</td><td><code>LocalBusiness</code></td></tr>
+      </table>
+      <p class="muted"><code class="inline">sameAs</code> is quietly one of the most valuable fields — it's how AI corroborates that this business is a real entity existing across multiple platforms. Include Google Business Profile, Facebook, LinkedIn, Yelp, industry directories.</p>
+
+      <h3>FAQPage schema <span class="tag">highest ROI for GEO</span></h3>
+      <p>FAQ markup maps <strong>exactly</strong> onto how people prompt AI. Someone types a question; the engine looks for a source that has that question with a clean answer under it. Add an FAQ block to every service page.</p>
+
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">JSON-LD — FAQPage</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre>&lt;script type="application/ld+json"&gt;
+{
+  <span class="k">"@context"</span>: <span class="s">"https://schema.org"</span>,
+  <span class="k">"@type"</span>: <span class="s">"FAQPage"</span>,
+  <span class="k">"mainEntity"</span>: [
+    {
+      <span class="k">"@type"</span>: <span class="s">"Question"</span>,
+      <span class="k">"name"</span>: <span class="s">"How much does duct cleaning cost in Melbourne?"</span>,
+      <span class="k">"acceptedAnswer"</span>: {
+        <span class="k">"@type"</span>: <span class="s">"Answer"</span>,
+        <span class="k">"text"</span>: <span class="s">"Duct cleaning in Melbourne typically costs between $199 and $499, depending on the number of vents. A standard 3-bedroom home with 8 vents averages $299. Pure Air charges a flat $299 for homes up to 10 vents, with no call-out fee."</span>
+      }
+    },
+    {
+      <span class="k">"@type"</span>: <span class="s">"Question"</span>,
+      <span class="k">"name"</span>: <span class="s">"How often should ducts be cleaned?"</span>,
+      <span class="k">"acceptedAnswer"</span>: {
+        <span class="k">"@type"</span>: <span class="s">"Answer"</span>,
+        <span class="k">"text"</span>: <span class="s">"Most Melbourne homes need duct cleaning every 2 to 3 years. Homes with pets, smokers, or allergy sufferers benefit from annual cleaning. Ducts that have never been cleaned in 5+ years typically show significant dust accumulation."</span>
+      }
+    }
+  ]
+}
+&lt;/script&gt;</pre>
+      </div>
+
+      <div class="warn">
+        <div class="lbl">Schema must mirror visible text</div>
+        <p>Never put answers in the JSON that don't appear on the page. That's cloaking, and it gets penalized. Write the FAQ section on the page first, then mirror it into schema.</p>
+      </div>
+
+      <h3>llms.txt <span class="tag">emerging standard</span></h3>
+      <p>A plain-text file at <code class="inline">/llms.txt</code> handing AI a curated map of the site. Cheap to add, and a nice "we're ahead of the curve" line in your deliverable.</p>
+
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">/llms.txt — site root</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre><span class="c"># Pure Air Duct Cleaning</span>
+
+&gt; Melbourne's duct cleaning specialists since 2005. Residential and commercial
+&gt; duct cleaning, sanitisation, and air quality services across metro Melbourne.
+
+<span class="c">## Services</span>
+- [Duct Cleaning](https://pureair.com.au/duct-cleaning): Full residential duct cleaning, $299 flat rate up to 10 vents
+- [Duct Sanitisation](https://pureair.com.au/sanitisation): Anti-microbial treatment for mould and bacteria
+- [Commercial Duct Cleaning](https://pureair.com.au/commercial): Offices, retail, and strata buildings
+
+<span class="c">## Information</span>
+- [FAQ](https://pureair.com.au/faq): Pricing, timing, and process questions answered
+- [About](https://pureair.com.au/about): 20 years in business, 12,000+ homes serviced
+- [Contact](https://pureair.com.au/contact): Melbourne metro, same-week bookings</pre>
+      </div>
+
+      <h3>Article schema, sitemap, canonicals</h3>
+      <p class="muted">Yoast/RankMath handle these automatically. Just verify: Article schema has <code class="inline">author</code>, <code class="inline">datePublished</code>, and especially <code class="inline">dateModified</code> (freshness signals depend on it), and the sitemap exists at <code class="inline">/sitemap_index.xml</code> and is referenced in robots.txt.</p>
+    </section>
+
+    <!-- ============ PHASE 3 ============ -->
+    <section class="phase" id="p3">
+      <div class="phase-head">
+        <span class="phase-num">PHASE 03</span>
+        <h2>Content citability</h2>
+      </div>
+      <div class="phase-meta">FIXES: Q&amp;A format · statistics · quotations · authority links · lists &amp; tables · paragraph length · headings · freshness</div>
+      <p class="phase-lead">
+        Phases 1–2 make the site <em>eligible</em> to be cited. Phase 3 makes it <strong>worth</strong> citing.
+        This is where most of your hours go — and what justifies the premium tier.
+      </p>
+
+      <p class="muted">The Princeton GEO research (KDD 2024) measured which content changes actually move AI citation rates:</p>
+      <table>
+        <tr><th>Tactic</th><th>Measured lift</th></tr>
+        <tr><td>Quotations</td><td><span class="lift">~+41%</span></td></tr>
+        <tr><td>Statistics</td><td><span class="lift">~+32%</span></td></tr>
+        <tr><td>Citing sources</td><td><span class="lift">~+30%</span></td></tr>
+        <tr><td>Precise terminology</td><td><span class="lift">~+28%</span></td></tr>
+      </table>
+
+      <h3>The core rewrite pattern</h3>
+      <p>Take each cornerstone page and restructure it. <strong>This transformation is what you're selling.</strong></p>
+
+      <div class="ba">
+        <div class="bad">
+          <div class="h">Before — uncitable</div>
+          <div class="body">
+            <p>At Pure Air, we pride ourselves on delivering exceptional duct cleaning services to our valued customers throughout the Melbourne region. Our dedicated team of professionals brings years of industry experience and a commitment to excellence that sets us apart from the competition, ensuring your home's air quality is the very best it can be.</p>
+            <p style="color:var(--red);font-size:12.5px;margin-top:14px;">No fact. No number. No answer to any question. There is nothing here an AI can lift. It is invisible.</p>
+          </div>
+        </div>
+        <div class="good">
+          <div class="h">After — citable</div>
+          <div class="body">
+            <p class="q">How much does duct cleaning cost in Melbourne?</p>
+            <p>Duct cleaning in Melbourne costs $199–$499 depending on vent count. Pure Air charges a flat <span class="hl">$299</span> for homes with up to 10 vents, with no call-out fee.</p>
+            <table>
+              <tr><th>Home</th><th>Vents</th><th>Price</th></tr>
+              <tr><td>Apartment</td><td>Up to 5</td><td>$199</td></tr>
+              <tr><td>Standard</td><td>6–10</td><td>$299</td></tr>
+              <tr><td>Large</td><td>11+</td><td>$399+</td></tr>
+            </table>
+            <p class="q">How long does duct cleaning take?</p>
+            <p>A standard clean takes <span class="hl">2–4 hours</span>. In 2025, <span class="hl">78%</span> of Pure Air jobs were completed in under 3 hours.</p>
+            <p style="border-left:2px solid var(--line);padding-left:10px;color:var(--muted-2);">"The dust difference was visible within a day — my daughter's asthma symptoms dropped noticeably," said Sarah M., a Brunswick customer, in a March 2026 review.</p>
+            <p>See the <span style="color:var(--green)">EPA's guidance on indoor air quality</span> for background.</p>
+            <p><em>Last updated: July 2026</em></p>
+          </div>
+        </div>
+      </div>
+      <p class="ba-note">
+        Same information. What changed structurally: <b>question-phrased H2s</b> · <b>direct answer in the first 1–2 sentences</b> · <b>concrete numbers</b> · <b>a table</b> · <b>an attributed quote</b> · <b>an outbound authority link</b> · <b>a visible date</b>. That's every Phase 3 check satisfied in one page.
+      </p>
+
+      <h3>The rules, applied to every page</h3>
+      <ol>
+        <li><strong>Answer-first.</strong> Under every question heading, the direct answer goes in the first 40–60 words. Don't build up to it — AI lifts the top of the section.</li>
+        <li><strong>Question headings.</strong> "Our Services" → "What duct cleaning services do we offer?" Use the phrasing real customers use.</li>
+        <li><strong>Numbers over adjectives.</strong> "Fast service" → "Same-week booking; 78% of jobs done in under 3 hours." Every vague claim becomes a specific one.</li>
+        <li><strong>Short paragraphs.</strong> 2–4 sentences, one idea each. Long paragraphs don't get lifted cleanly.</li>
+        <li><strong>Lists and tables</strong> for anything comparable — pricing, service areas, process steps.</li>
+        <li><strong>One attributed quote minimum</strong> per cornerstone page. Owner, technician, customer review, industry expert. Attribution matters.</li>
+        <li><strong>Link out to authorities.</strong> .gov, .edu, industry bodies, research. Counterintuitive but proven: citing sources makes <em>you</em> more citable.</li>
+        <li><strong>Visible date stamps.</strong> "Last updated: July 2026". AI has a strong recency bias. Refresh quarterly.</li>
+      </ol>
+
+      <h3>Target the fan-out queries</h3>
+      <p>When someone asks AI a long question, the engine <strong>breaks it into smaller sub-queries</strong> and searches each separately. <em class="muted">"Best duct cleaner in Melbourne for a house with pets"</em> fans out into "duct cleaning Melbourne," "duct cleaning pet dander," "duct cleaning cost." The client needs content answering each fragment.</p>
+      <p class="muted">Practically: ask the owner <b>"what do customers actually ask you on the phone?"</b> — those exact phrasings become your H2s. This is also exactly what <span style="color:var(--green)">PSEO Studio already generates at scale</span>. The two products fit together: PSEO generates the page inventory, GEO makes each page citable.</p>
+
+      <h3>Off-site — the part you must be honest about</h3>
+      <div class="warn">
+        <div class="lbl">Tell clients this instead of hiding it</div>
+        <p>The <b>majority of AI citations come from earned media</b> — third-party sources, not the brand's own website. On-site optimization is necessary but <em>not sufficient</em>.</p>
+      </div>
+      <p class="muted">Highest-leverage off-site moves, in order of accessibility:</p>
+      <ul>
+        <li><strong>Google Business Profile</strong> — fully filled, categories correct, Q&amp;A populated, reviews answered. Free, fast, feeds local AI answers directly.</li>
+        <li><strong>Reddit and YouTube</strong> — among the most-cited sources in AI answers. Genuine participation gets cited.</li>
+        <li><strong>Directories &amp; citations</strong> — Yelp, Clutch, Avvo (legal), industry associations. Consistent NAP everywhere.</li>
+        <li><strong>Wikipedia/Wikidata entity</strong> — larger brands only. Don't promise this to a plumber.</li>
+        <li><strong>Guest posts / press</strong> — slow and hard. <span style="color:var(--amber)">Don't oversell.</span></li>
+      </ul>
+      <p class="muted">Scope this honestly in your gig. You can do the first three. You cannot promise Forbes.</p>
+    </section>
+
+    <!-- ============ PHASE 4 ============ -->
+    <section class="phase" id="p4">
+      <div class="phase-head">
+        <span class="phase-num">PHASE 04</span>
+        <h2>Verify and prove</h2>
+      </div>
+      <div class="phase-meta">This is what converts a one-time gig into a retainer and a case study.</div>
+
+      <h3>Re-run the audit</h3>
+      <p>Same tool, same site. The before/after score is the deliverable that justifies the invoice: <em>"Your AI visibility score went from 34/100 (F) to 88/100 (B+)."</em> Screenshot both.</p>
+
+      <h3>Manual citation testing <span class="tag">worth more than any score</span></h3>
+      <p>Actually go ask the engines. Open ChatGPT, Perplexity, Claude, and Google AI Mode, and run the client's real customer questions:</p>
+      <div class="code">
+        <div class="code-bar">
+          <span class="code-name">test prompts — screenshot the answers</span>
+          <button class="copy">Copy</button>
+        </div>
+<pre>Who's the best duct cleaning company in Melbourne?
+How much does duct cleaning cost in Melbourne?
+Duct cleaning near Brunswick with good reviews</pre>
+      </div>
+      <div class="warn">
+        <div class="lbl">Do this BEFORE you start work</div>
+        <p>Screenshot the engines <b>failing to mention the client</b> during the audit phase. Then again 4–8 weeks after. That before/after pair sells your next three gigs.</p>
+      </div>
+
+      <h4>Set the timeline honestly</h4>
+      <p>Re-crawling and re-indexing takes time. Perplexity moves fastest (it favors recent content). ChatGPT can take weeks. Tell the client <strong>4–8 weeks minimum</strong> before citation changes appear. <span style="color:var(--amber)">Anyone promising instant AI ranking is lying — and if you promise it, you'll eat the refund.</span></p>
+
+      <h3>Ongoing monitoring <span class="tag">your retainer hook</span></h3>
+      <p class="muted">Monthly: re-run the audit, re-test the citation prompts, check server logs for AI bot hits. Legitimate $99–$299/month recurring — and it's the same work every month, which is exactly what you want.</p>
+    </section>
+
+    <!-- ============ PRICING ============ -->
+    <section class="phase" id="pricing">
+      <div class="phase-head">
+        <span class="phase-num">PACKAGING</span>
+        <h2>Turning this into a gig</h2>
+      </div>
+
+      <table>
+        <tr><th>Tier</th><th>Scope</th><th>Price</th></tr>
+        <tr><td><b>Basic</b></td><td>Audit only: PDF report + 5-min Loom walkthrough</td><td>$45–75</td></tr>
+        <tr><td><b>Standard</b></td><td>Phase 1 + 2 — access, all schema, llms.txt, sitemap</td><td>$150–300</td></tr>
+        <tr><td><b>Premium</b></td><td>Phases 1–3 + rewrite 5–10 cornerstone pages + before/after audit</td><td>$400–800</td></tr>
+        <tr><td><b>Retainer</b></td><td>Monthly re-audit, citation tracking, content refresh, GBP management</td><td>$99–299/mo</td></tr>
+      </table>
+
+      <h3>Delivery checklist <span class="tag">standard / premium</span></h3>
+      <div class="check">
+        <label><input type="checkbox"><span>Before-audit PDF + screenshots of AI engines <em>not</em> mentioning them</span></label>
+        <label><input type="checkbox"><span>robots.txt fixed + curl proof of GPTBot/ClaudeBot returning 200</span></label>
+        <label><input type="checkbox"><span>Cloudflare AI blocking disabled (if applicable)</span></label>
+        <label><input type="checkbox"><span>Organization/LocalBusiness schema live and validated</span></label>
+        <label><input type="checkbox"><span>FAQPage schema on all service pages</span></label>
+        <label><input type="checkbox"><span>llms.txt published at site root</span></label>
+        <label><input type="checkbox"><span>N pages rewritten to answer-first Q&amp;A format</span></label>
+        <label><input type="checkbox"><span>After-audit PDF showing the score jump</span></label>
+        <label><input type="checkbox"><span>Google Business Profile optimized</span></label>
+        <label><input type="checkbox"><span>4–8 week follow-up citation re-test scheduled</span></label>
+      </div>
+      <p class="muted">Validate schema before delivery — paste the URL into <b>search.google.com/test/rich-results</b> and <b>validator.schema.org</b>. Broken JSON-LD is worse than none.</p>
+    </section>
+
+    <!-- ============ BITES ============ -->
+    <section class="phase bites" id="bites">
+      <div class="phase-head">
+        <span class="phase-num">WARNING</span>
+        <h2>The three things that will bite you</h2>
+      </div>
+      <div class="bite">
+        <span class="n">01</span>
+        <div>
+          <b>Cloudflare.</b>
+          <p>You'll fix robots.txt, feel accomplished, and the site will still be blocked at the network layer. Always run the curl check.</p>
+        </div>
+      </div>
+      <div class="bite">
+        <span class="n">02</span>
+        <div>
+          <b>Schema/content mismatch.</b>
+          <p>Never put text in JSON-LD that isn't visible on the page. That's cloaking.</p>
+        </div>
+      </div>
+      <div class="bite">
+        <span class="n">03</span>
+        <div>
+          <b>Timeline promises.</b>
+          <p>AI re-indexing takes weeks. Say "4–8 weeks" in writing, in the gig description, <em>before</em> you take the money.</p>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  // Copy buttons — grab the sibling <pre>, strip syntax spans, preserve text
+  document.querySelectorAll('.copy').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var pre = btn.closest('.code').querySelector('pre');
+      var text = pre.innerText;
+      navigator.clipboard.writeText(text).then(function () {
+        var old = btn.textContent;
+        btn.textContent = 'Copied';
+        btn.classList.add('done');
+        setTimeout(function () {
+          btn.textContent = old;
+          btn.classList.remove('done');
+        }, 1400);
+      }).catch(function () {
+        btn.textContent = 'Select manually';
+        setTimeout(function () { btn.textContent = 'Copy'; }, 1800);
+      });
+    });
+  });
+
+  // Phase spine — track which section is in view
+  var stations = document.querySelectorAll('.station');
+  var sections = Array.prototype.map.call(stations, function (s) {
+    return document.querySelector(s.getAttribute('href'));
+  });
+
+  function sync() {
+    var pos = window.scrollY + window.innerHeight * 0.3;
+    var idx = 0;
+    sections.forEach(function (sec, i) {
+      if (sec && sec.offsetTop <= pos) idx = i;
+    });
+    stations.forEach(function (s, i) {
+      s.classList.toggle('active', i === idx);
+    });
+  }
+  window.addEventListener('scroll', sync, { passive: true });
+  window.addEventListener('resize', sync);
+  sync();
+</script>
+</body>
+</html>
