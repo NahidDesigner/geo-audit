@@ -123,7 +123,8 @@ def discover_pages(home_url, soup, root_netloc, max_pages):
 # ----------------------------------------------------------------------------
 
 class Check:
-    def __init__(self, category, name, status, points, max_points, detail, fix):
+    def __init__(self, category, name, status, points, max_points, detail, fix,
+                 impact="medium", why=""):
         self.category = category      # str
         self.name = name              # str
         self.status = status          # "pass" | "warn" | "fail"
@@ -131,23 +132,96 @@ class Check:
         self.max_points = max_points  # possible
         self.detail = detail          # what we found
         self.fix = fix                # recommendation if not passing
+        self.impact = impact          # "critical" | "high" | "medium" | "low"
+        self.why = why                # plain-English business consequence
 
     def as_dict(self):
         return self.__dict__.copy()
 
 
+# Business impact of each check when it FAILS. Point weight is not the same as
+# severity: llms.txt (4pts) is a nice-to-have, Cloudflare blocking (4pts) can
+# make a site permanently invisible. This drives the priority section of the
+# report.
+IMPACT = {
+    "AI crawlers allowed in robots.txt": ("critical",
+        "AI engines are blocked from reading this site entirely. No other "
+        "optimization can work until this is fixed."),
+    "CDN bot-blocking risk (Cloudflare)": ("critical",
+        "The CDN may be blocking AI crawlers at the network level, even though "
+        "robots.txt permits them. This is invisible without testing."),
+    "CDN bot-blocking risk": ("critical",
+        "The CDN may be blocking AI crawlers at the network level."),
+    "Content readable without JavaScript": ("critical",
+        "Most AI crawlers do not run JavaScript. Content that only appears after "
+        "scripts execute is invisible to them."),
+    "XML sitemap present": ("high",
+        "Without a sitemap, AI engines may never discover most pages on the site."),
+    "JSON-LD structured data present": ("high",
+        "Schema markup is how AI understands what this business is and does."),
+    "Organization / LocalBusiness schema": ("high",
+        "The business is not machine-identifiable as an entity, weakening every "
+        "AI answer that might otherwise name it."),
+    "Q&A formatted content": ("high",
+        "People ask AI questions. Content structured as direct answers is what "
+        "gets extracted and cited."),
+    "Statistics & data points": ("high",
+        "Concrete figures are one of the strongest drivers of AI citation."),
+    "FAQPage schema": ("medium",
+        "FAQ markup maps directly onto how users phrase questions to AI."),
+    "Freshness signals": ("medium",
+        "AI engines favour recent content. Undated pages lose ground to dated ones."),
+    "Quotations with attribution": ("medium",
+        "Attributed quotes were the single strongest citation factor in published "
+        "GEO research."),
+    "H1 + logical heading structure": ("medium",
+        "AI extraction relies on heading hierarchy to understand page structure."),
+    "Citations to authoritative sources": ("medium",
+        "Pages that cite credible sources are themselves cited more often."),
+    "Contact info (NAP) present": ("medium",
+        "Consistent name, address and phone reinforce the business as a real entity."),
+    "Author attribution on content": ("medium",
+        "AI weighs authorship and expertise when choosing which sources to trust."),
+    "Article/BlogPosting schema": ("low",
+        "Article markup supplies author and date signals on posts."),
+    "Canonical + meta description": ("low",
+        "These feed the snippets retrieval systems evaluate."),
+    "Lists, tables & extractable blocks": ("low",
+        "Lists and tables are lifted into AI answers more readily than prose."),
+    "Paragraph length (extractability)": ("low",
+        "Shorter paragraphs are easier for AI to quote cleanly."),
+    "About page discoverable": ("low",
+        "An About page strengthens the entity profile AI builds for the brand."),
+    "Cross-platform entity corroboration": ("low",
+        "AI corroborates businesses across multiple platforms."),
+    "llms.txt present": ("low",
+        "An emerging standard that hands AI a curated map of key pages."),
+    "robots.txt reachable": ("high",
+        "Without robots.txt you lose control over crawler access and the sitemap hint."),
+}
+
+IMPACT_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+IMPACT_META = {
+    "critical": ("CRITICAL", "#dc2626", "#fef2f2"),
+    "high":     ("HIGH",     "#ea580c", "#fff7ed"),
+    "medium":   ("MEDIUM",   "#d97706", "#fffbeb"),
+    "low":      ("LOW",      "#64748b", "#f8fafc"),
+}
+
+
 def make_check(checks, category, name, ok, max_points, detail_pass, detail_fail, fix,
                warn=False):
     """Append a pass/warn/fail check. warn=True gives half points."""
+    impact, why = IMPACT.get(name, ("medium", ""))
     if ok:
         checks.append(Check(category, name, "pass", max_points, max_points,
-                            detail_pass, ""))
+                            detail_pass, "", impact, why))
     elif warn:
         checks.append(Check(category, name, "warn", max_points // 2, max_points,
-                            detail_fail, fix))
+                            detail_fail, fix, impact, why))
     else:
         checks.append(Check(category, name, "fail", 0, max_points,
-                            detail_fail, fix))
+                            detail_fail, fix, impact, why))
 
 
 # ----------------------------------------------------------------------------
@@ -609,159 +683,350 @@ def build_html(site, brand, checks, data, internal=True):
     score = round(100 * total / maxi) if maxi else 0
     grade, color = next((g, c) for t, g, c in GRADE_BANDS if score >= t)
 
+    fails = sum(1 for c in checks if c.status == "fail")
+    warns = sum(1 for c in checks if c.status == "warn")
+    passes = sum(1 for c in checks if c.status == "pass")
+    issues = [c for c in checks if c.status != "pass"]
+    issues.sort(key=lambda c: (IMPACT_ORDER[c.impact], -c.max_points))
+    crits = [c for c in issues if c.impact == "critical"]
+
+    pages = data.get("pages_analyzed", 0)
+    date = datetime.now().strftime("%B %d, %Y")
+    donut = 2 * 3.14159 * 52          # r=52 circumference
+    dash = donut * score / 100
+
+    # ---------- headline verdict (the one line that frames everything) ----------
+    if crits:
+        verdict_bg, verdict_bd, verdict_ic = "#fef2f2", "#fecaca", "#dc2626"
+        verdict_h = f"{len(crits)} critical {'issue is' if len(crits)==1 else 'issues are'} limiting AI visibility right now"
+        verdict_p = ("Critical issues affect whether AI engines can access or read the site at all. "
+                     "Until these are resolved, other improvements have limited effect.")
+    elif score >= 90:
+        verdict_bg, verdict_bd, verdict_ic = "#f0fdf4", "#bbf7d0", "#16a34a"
+        verdict_h = "This site is well positioned for AI search"
+        verdict_p = ("AI engines can access, understand, and cite this website. The remaining items "
+                     "below are refinements rather than obstacles.")
+    elif score >= 60:
+        verdict_bg, verdict_bd, verdict_ic = "#fffbeb", "#fde68a", "#d97706"
+        verdict_h = "The foundations are in place, but AI engines are under-using this site"
+        verdict_p = ("AI can reach the site, but gaps in structure and content mean it is being cited "
+                     "less often than it could be. The priorities below have the largest effect.")
+    else:
+        verdict_bg, verdict_bd, verdict_ic = "#fff7ed", "#fed7aa", "#ea580c"
+        verdict_h = "AI engines are unlikely to cite this site in its current state"
+        verdict_p = ("Significant gaps across access, structure, and content mean AI assistants have "
+                     "little to work with. The priorities below are where to start.")
+
+    # ---------- category summary strip ----------
     cats = {}
     for c in checks:
         cats.setdefault(c.category, []).append(c)
 
-    def cat_rows(items):
+    CAT_BLURB = {
+        "AI Crawler Access": "Can AI engines reach and read the site?",
+        "Structured Data": "Can they understand what this business is?",
+        "Content Citability": "Is the content worth quoting in an answer?",
+        "Entity & Trust": "Do they trust this as a real, credible business?",
+    }
+
+    strip = ""
+    for cat, items in cats.items():
+        e = sum(c.points for c in items)
+        p = sum(c.max_points for c in items)
+        pct = round(100 * e / p) if p else 0
+        bar = "#16a34a" if pct >= 80 else "#d97706" if pct >= 50 else "#dc2626"
+        strip += f"""
+        <div class="cat-card">
+          <div class="cat-card-name">{cat}</div>
+          <div class="cat-card-q">{CAT_BLURB.get(cat, '')}</div>
+          <div class="cat-card-pct" style="color:{bar}">{pct}%</div>
+          <div class="minibar"><div style="width:{pct}%;background:{bar}"></div></div>
+        </div>"""
+
+    # ---------- priority roadmap ----------
+    def prio_rows(items, limit=None):
+        out, shown = "", items[:limit] if limit else items
+        for i, c in enumerate(shown, 1):
+            lbl, col, bg = IMPACT_META[c.impact]
+            fixhtml = (f'<div class="fix"><span class="fix-lbl">How to fix</span>{c.fix}</div>'
+                       if (internal and c.fix) else "")
+            out += f"""
+            <div class="prio">
+              <div class="prio-rank">{i}</div>
+              <div class="prio-body">
+                <div class="prio-top">
+                  <span class="impact" style="color:{col};background:{bg};border-color:{col}40">{lbl}</span>
+                  <span class="prio-name">{c.name}</span>
+                </div>
+                <div class="prio-why">{c.why}</div>
+                <div class="prio-found"><b>What we found:</b> {c.detail}</div>
+                {fixhtml}
+              </div>
+            </div>"""
+        return out
+
+    if issues:
+        roadmap = f"""
+      <section class="block">
+        <div class="block-head">
+          <h2>Priorities</h2>
+          <div class="block-sub">Ordered by business impact, not by score. Fix from the top down &mdash;
+            access issues must be resolved before content work has any effect.</div>
+        </div>
+        {prio_rows(issues, 6)}
+        {'<div class="more">Plus ' + str(len(issues) - 6) + ' further items in the full breakdown below.</div>' if len(issues) > 6 else ''}
+      </section>"""
+    else:
+        roadmap = """
+      <section class="block">
+        <div class="block-head"><h2>Priorities</h2></div>
+        <div class="allclear">Every check passed. There are no outstanding issues limiting AI
+        visibility on this site.</div>
+      </section>"""
+
+    # ---------- full breakdown ----------
+    def detail_rows(items):
         rows = ""
         for c in items:
-            label, scol, sbg = STATUS_META[c.status]
-            fix = (f'<div class="fix"><strong>Recommended fix:</strong> {c.fix}</div>'
-                   if (internal and c.fix) else "")
+            lbl, scol, sbg = STATUS_META[c.status]
+            fixhtml = (f'<div class="fix"><span class="fix-lbl">How to fix</span>{c.fix}</div>'
+                       if (internal and c.fix) else "")
             rows += f"""
-            <div class="check">
+            <div class="check {c.status}">
               <div class="check-head">
-                <span class="badge" style="color:{scol};background:{sbg};border:1px solid {scol}33">{label}</span>
+                <span class="badge" style="color:{scol};background:{sbg};border-color:{scol}40">{lbl}</span>
                 <span class="check-name">{c.name}</span>
                 <span class="pts">{c.points}/{c.max_points}</span>
               </div>
               <div class="detail">{c.detail}</div>
-              {fix}
+              {fixhtml}
             </div>"""
         return rows
 
-    cat_html = ""
+    breakdown = ""
     for cat, items in cats.items():
-        earned = sum(c.points for c in items)
-        possible = sum(c.max_points for c in items)
-        pct = round(100 * earned / possible) if possible else 0
-        cat_html += f"""
+        e = sum(c.points for c in items)
+        p = sum(c.max_points for c in items)
+        pct = round(100 * e / p) if p else 0
+        breakdown += f"""
         <section class="category">
           <div class="cat-head">
-            <h2>{cat}</h2>
-            <div class="cat-score">{earned}/{possible} pts</div>
+            <div>
+              <h3>{cat}</h3>
+              <div class="cat-q">{CAT_BLURB.get(cat, '')}</div>
+            </div>
+            <div class="cat-score">{e}<span>/{p}</span></div>
           </div>
           <div class="bar"><div class="bar-fill" style="width:{pct}%"></div></div>
-          {cat_rows(items)}
+          {detail_rows(items)}
         </section>"""
 
-    fails = sum(1 for c in checks if c.status == "fail")
-    warns = sum(1 for c in checks if c.status == "warn")
-    passes = sum(1 for c in checks if c.status == "pass")
-    issues = fails + warns
-
+    # ---------- closing ----------
     if internal:
-        intro_tail = ("Every failed item below includes the concrete fix we recommend.")
         closing = ""
+    elif issues:
+        n = len(issues)
+        closing = f"""
+      <section class="closing">
+        <h2>What happens next</h2>
+        <p>This audit identified <b>{n} issue{'s' if n != 1 else ''}</b> limiting how AI assistants
+        find, understand, and cite this website{' &mdash; including <b>' + str(len(crits)) + ' critical</b>' if crits else ''}.
+        Each one is fixable.</p>
+        <p>The order matters: crawler access must be resolved before structural or content work has
+        any effect. {brand} can implement these fixes and re-run this audit to verify the improvement
+        against today's baseline score of <b>{score}/100</b>.</p>
+        <p class="cta">Contact {brand} to discuss scope and timeline.</p>
+      </section>"""
     else:
-        intro_tail = ("The findings below show exactly where this site stands today.")
-        n_txt = ("no issues" if issues == 0 else
-                 "1 issue" if issues == 1 else f"{issues} issues")
-        if issues == 0:
-            closing = f"""
-  <div class="closing">
-    <strong>This site is in strong shape for AI search.</strong> Every check passed.
-    Keeping it that way requires ongoing attention as AI engines change how they
-    crawl and cite - {brand} can monitor this and flag regressions before they
-    cost visibility.
-  </div>"""
-        else:
-            closing = f"""
-  <div class="closing">
-    <strong>What happens next.</strong> This audit identified <b>{n_txt}</b> limiting
-    how AI engines find, understand, and cite this website. Each one is fixable, and
-    most can be resolved quickly - but the order matters: crawler access issues must
-    be resolved before content or schema work has any effect.
-    <br><br>
-    {brand} can implement these fixes and re-run this audit to verify the improvement.
-    Contact us to discuss scope and timeline.
-  </div>"""
+        closing = f"""
+      <section class="closing">
+        <h2>What happens next</h2>
+        <p>This site is in strong shape for AI search &mdash; every check passed. AI engines change how
+        they crawl and cite content regularly, so today's score is a snapshot, not a guarantee.</p>
+        <p class="cta">{brand} can monitor this and flag regressions before they cost visibility.</p>
+      </section>"""
+
+    internal_tag = ('<div class="internal-tag">INTERNAL COPY &mdash; INCLUDES FIXES &mdash; NOT FOR CLIENT</div>'
+                    if internal else '')
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <title>AI Visibility Audit - {site}</title>
 <style>
-  @page {{ size: A4; margin: 16mm 14mm; }}
-  * {{ box-sizing: border-box; }}
-  body {{ font-family: 'Segoe UI', Arial, sans-serif; color:#1e293b; margin:0;
-         font-size:11.5px; line-height:1.55; }}
+  @page {{ size:A4; margin:14mm 13mm 16mm; }}
+  * {{ box-sizing:border-box; }}
+  body {{ font-family:'Segoe UI',Helvetica,Arial,sans-serif; color:#1e293b; margin:0;
+         font-size:11px; line-height:1.55; }}
+  h1,h2,h3 {{ margin:0; }}
+
+  /* ---------- cover ---------- */
   .cover {{ background:linear-gradient(135deg,#0f172a 0%,#1e3a8a 100%); color:#fff;
-            padding:34px 30px; border-radius:14px; margin-bottom:22px; }}
-  .cover .brand {{ font-size:11px; letter-spacing:2.5px; text-transform:uppercase;
-                   color:#93c5fd; margin-bottom:10px; }}
-  .cover h1 {{ margin:0 0 6px; font-size:26px; }}
-  .cover .site {{ font-size:14px; color:#cbd5e1; }}
-  .scoreband {{ display:flex; align-items:center; gap:24px; margin-top:22px; }}
-  .score-circle {{ width:96px; height:96px; border-radius:50%; background:#fff;
-                   display:flex; flex-direction:column; align-items:center; justify-content:center; }}
-  .score-circle .num {{ font-size:30px; font-weight:800; color:{color}; line-height:1; }}
-  .score-circle .of {{ font-size:9px; color:#64748b; }}
-  .grade-pill {{ font-size:20px; font-weight:800; background:{color}; padding:8px 20px;
-                 border-radius:10px; }}
-  .tallies {{ display:flex; gap:14px; font-size:11px; color:#e2e8f0; }}
-  .tallies b {{ font-size:16px; display:block; }}
-  .summary {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px;
-              padding:14px 18px; margin-bottom:20px; }}
-  .category {{ margin-bottom:20px; page-break-inside:avoid; }}
-  .cat-head {{ display:flex; justify-content:space-between; align-items:baseline; }}
-  .cat-head h2 {{ font-size:15px; margin:0 0 6px; color:#0f172a; }}
-  .cat-score {{ font-weight:700; color:#475569; }}
-  .bar {{ height:7px; background:#e2e8f0; border-radius:4px; margin-bottom:12px; }}
-  .bar-fill {{ height:100%; border-radius:4px; background:linear-gradient(90deg,#3b82f6,#1d4ed8); }}
-  .check {{ border:1px solid #e2e8f0; border-radius:8px; padding:10px 12px; margin-bottom:8px;
-            page-break-inside:avoid; }}
-  .check-head {{ display:flex; align-items:center; gap:10px; }}
-  .badge {{ font-size:9px; font-weight:800; letter-spacing:.6px; padding:2.5px 8px;
-            border-radius:20px; white-space:nowrap; }}
-  .check-name {{ font-weight:700; flex:1; }}
-  .pts {{ color:#64748b; font-weight:700; }}
-  .detail {{ margin-top:5px; color:#334155; }}
-  .fix {{ margin-top:6px; background:#eff6ff; border-left:3px solid #3b82f6;
-          padding:6px 10px; border-radius:0 6px 6px 0; color:#1e3a8a; }}
-  .closing {{ background:#f0f9ff; border:1px solid #bae6fd; border-radius:10px;
-              padding:16px 18px; margin-top:22px; color:#0c4a6e;
+            padding:30px 32px; border-radius:12px; margin-bottom:16px; }}
+  .cover .brand {{ font-size:10px; letter-spacing:2.6px; text-transform:uppercase;
+                   color:#93c5fd; margin-bottom:12px; font-weight:600; }}
+  .cover h1 {{ font-size:25px; letter-spacing:-.3px; margin-bottom:5px; }}
+  .cover .site {{ font-size:12px; color:#cbd5e1; }}
+  .scoreband {{ display:flex; align-items:center; gap:26px; margin-top:24px; }}
+  .donut {{ position:relative; width:118px; height:118px; flex:0 0 118px; }}
+  .donut svg {{ transform:rotate(-90deg); }}
+  .donut .val {{ position:absolute; inset:0; display:flex; flex-direction:column;
+                 align-items:center; justify-content:center; }}
+  .donut .n {{ font-size:31px; font-weight:800; line-height:1; }}
+  .donut .d {{ font-size:9px; color:#94a3b8; letter-spacing:.6px; margin-top:2px; }}
+  .grade-pill {{ display:inline-block; font-size:17px; font-weight:800; background:{color};
+                 padding:7px 18px; border-radius:8px; margin-bottom:12px; }}
+  .tallies {{ display:flex; gap:20px; }}
+  .tallies div {{ font-size:9.5px; color:#cbd5e1; letter-spacing:.4px;
+                  text-transform:uppercase; }}
+  .tallies b {{ display:block; font-size:19px; margin-bottom:1px; }}
+
+  /* ---------- verdict ---------- */
+  .verdict {{ background:{verdict_bg}; border:1px solid {verdict_bd};
+              border-left:4px solid {verdict_ic}; border-radius:9px;
+              padding:14px 18px; margin-bottom:16px; page-break-inside:avoid; }}
+  .verdict h2 {{ font-size:14.5px; color:#0f172a; margin-bottom:4px; }}
+  .verdict p {{ margin:0; color:#475569; }}
+
+  /* ---------- what this measures ---------- */
+  .explain {{ background:#f8fafc; border:1px solid #e2e8f0; border-radius:9px;
+              padding:13px 16px; margin-bottom:16px; color:#475569;
               page-break-inside:avoid; }}
-  .internal-tag {{ display:inline-block; background:#fef2f2; color:#b91c1c;
-                   border:1px solid #fecaca; border-radius:5px; font-size:9px;
-                   font-weight:800; letter-spacing:1px; padding:3px 9px;
-                   margin-bottom:10px; }}
-  footer {{ margin-top:26px; padding-top:12px; border-top:1px solid #e2e8f0;
-            color:#94a3b8; font-size:10px; }}
+  .explain b {{ color:#0f172a; }}
+  .internal-tag {{ display:inline-block; background:#7f1d1d; color:#fff;
+                   border-radius:4px; font-size:8.5px; font-weight:800;
+                   letter-spacing:1.1px; padding:3px 9px; margin-bottom:9px; }}
+
+  /* ---------- category strip ---------- */
+  .strip {{ display:flex; gap:9px; margin-bottom:22px; page-break-inside:avoid; }}
+  .cat-card {{ flex:1; border:1px solid #e2e8f0; border-radius:9px; padding:11px 12px;
+               background:#fff; }}
+  .cat-card-name {{ font-size:10.5px; font-weight:700; color:#0f172a;
+                    margin-bottom:2px; }}
+  .cat-card-q {{ font-size:9px; color:#94a3b8; line-height:1.4; min-height:25px; }}
+  .cat-card-pct {{ font-size:20px; font-weight:800; margin:4px 0 5px; }}
+  .minibar {{ height:4px; background:#f1f5f9; border-radius:3px; overflow:hidden; }}
+  .minibar div {{ height:100%; border-radius:3px; }}
+
+  /* ---------- blocks ---------- */
+  .block {{ margin-bottom:24px; }}
+  .block-head {{ margin-bottom:12px; }}
+  .block-head h2 {{ font-size:17px; color:#0f172a; letter-spacing:-.2px; }}
+  .block-sub {{ font-size:10.5px; color:#64748b; margin-top:3px; max-width:82%; }}
+
+  /* ---------- priority items ---------- */
+  .prio {{ display:flex; gap:12px; border:1px solid #e2e8f0; border-left:3px solid #cbd5e1;
+           border-radius:8px; padding:12px 14px; margin-bottom:9px;
+           page-break-inside:avoid; background:#fff; }}
+  .prio-rank {{ flex:0 0 22px; height:22px; border-radius:50%; background:#0f172a;
+                color:#fff; font-size:11px; font-weight:800; display:flex;
+                align-items:center; justify-content:center; }}
+  .prio-body {{ flex:1; }}
+  .prio-top {{ display:flex; align-items:center; gap:8px; margin-bottom:4px; }}
+  .impact {{ font-size:8.5px; font-weight:800; letter-spacing:.8px; padding:2px 7px;
+             border-radius:20px; border:1px solid; white-space:nowrap; }}
+  .prio-name {{ font-weight:700; font-size:12px; color:#0f172a; }}
+  .prio-why {{ color:#475569; margin-bottom:5px; }}
+  .prio-found {{ color:#64748b; font-size:10.5px; }}
+  .prio-found b {{ color:#475569; }}
+  .more {{ font-size:10.5px; color:#94a3b8; text-align:center; padding:6px; }}
+  .allclear {{ background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px;
+               padding:14px 16px; color:#166534; }}
+
+  /* ---------- fixes (internal only) ---------- */
+  .fix {{ margin-top:7px; background:#eff6ff; border-left:3px solid #3b82f6;
+          padding:7px 11px; border-radius:0 6px 6px 0; color:#1e3a8a; }}
+  .fix-lbl {{ display:block; font-size:8.5px; font-weight:800; letter-spacing:.9px;
+              text-transform:uppercase; color:#3b82f6; margin-bottom:2px; }}
+
+  /* ---------- full breakdown ---------- */
+  .category {{ margin-bottom:18px; page-break-inside:avoid; }}
+  .cat-head {{ display:flex; justify-content:space-between; align-items:flex-end;
+               margin-bottom:6px; }}
+  .cat-head h3 {{ font-size:14px; color:#0f172a; }}
+  .cat-q {{ font-size:9.5px; color:#94a3b8; margin-top:1px; }}
+  .cat-score {{ font-size:16px; font-weight:800; color:#0f172a; }}
+  .cat-score span {{ font-size:11px; color:#94a3b8; font-weight:600; }}
+  .bar {{ height:5px; background:#f1f5f9; border-radius:3px; margin-bottom:10px; }}
+  .bar-fill {{ height:100%; border-radius:3px;
+               background:linear-gradient(90deg,#3b82f6,#1d4ed8); }}
+  .check {{ border:1px solid #e2e8f0; border-radius:7px; padding:9px 12px;
+            margin-bottom:6px; page-break-inside:avoid; }}
+  .check.fail {{ border-left:3px solid #dc2626; }}
+  .check.warn {{ border-left:3px solid #d97706; }}
+  .check.pass {{ border-left:3px solid #16a34a; }}
+  .check-head {{ display:flex; align-items:center; gap:9px; }}
+  .badge {{ font-size:8.5px; font-weight:800; letter-spacing:.7px; padding:2px 7px;
+            border-radius:20px; border:1px solid; white-space:nowrap; }}
+  .check-name {{ font-weight:700; flex:1; font-size:11.5px; }}
+  .pts {{ color:#94a3b8; font-weight:700; font-size:10.5px; }}
+  .detail {{ margin-top:4px; color:#475569; }}
+
+  /* ---------- closing ---------- */
+  .closing {{ background:#f0f9ff; border:1px solid #bae6fd; border-radius:10px;
+              padding:18px 20px; margin-top:24px; page-break-inside:avoid; }}
+  .closing h2 {{ font-size:15px; color:#0c4a6e; margin-bottom:7px; }}
+  .closing p {{ color:#0c4a6e; margin:0 0 8px; }}
+  .closing .cta {{ font-weight:700; margin:10px 0 0; }}
+
+  footer {{ margin-top:22px; padding-top:11px; border-top:1px solid #e2e8f0;
+            color:#94a3b8; font-size:9px; }}
 </style></head>
 <body>
   <div class="cover">
     <div class="brand">{brand}</div>
     <h1>AI Visibility Audit</h1>
-    <div class="site">{site} &nbsp;&bull;&nbsp; {datetime.now().strftime('%B %d, %Y')}
-      &nbsp;&bull;&nbsp; {data.get('pages_analyzed', 0) + 0} pages analyzed</div>
+    <div class="site">{site} &nbsp;&bull;&nbsp; {date} &nbsp;&bull;&nbsp; {pages} pages analyzed</div>
     <div class="scoreband">
-      <div class="score-circle"><div class="num">{score}</div><div class="of">/ 100</div></div>
-      <div class="grade-pill">Grade {grade}</div>
-      <div class="tallies">
-        <div><b style="color:#86efac">{passes}</b>passed</div>
-        <div><b style="color:#fcd34d">{warns}</b>needs work</div>
-        <div><b style="color:#fca5a5">{fails}</b>failed</div>
+      <div class="donut">
+        <svg width="118" height="118">
+          <circle cx="59" cy="59" r="52" fill="none" stroke="#334155" stroke-width="10"/>
+          <circle cx="59" cy="59" r="52" fill="none" stroke="{color}" stroke-width="10"
+                  stroke-linecap="round" stroke-dasharray="{dash:.1f} {donut:.1f}"/>
+        </svg>
+        <div class="val"><div class="n" style="color:{color}">{score}</div><div class="d">OUT OF 100</div></div>
+      </div>
+      <div>
+        <div class="grade-pill">Grade {grade}</div>
+        <div class="tallies">
+          <div><b style="color:#86efac">{passes}</b>passed</div>
+          <div><b style="color:#fcd34d">{warns}</b>needs work</div>
+          <div><b style="color:#fca5a5">{fails}</b>failed</div>
+        </div>
       </div>
     </div>
   </div>
 
-  <div class="summary">
-    {'<div class="internal-tag">INTERNAL - NOT FOR CLIENT</div>' if internal else ''}
-    <strong>What this report measures.</strong> AI assistants (ChatGPT, Claude, Perplexity,
-    Google AI Overviews) now answer a large share of customer questions directly. This audit
-    scores whether those engines can <em>access</em>, <em>understand</em>, and <em>cite</em>
-    this website - across crawler access, structured data, content citability, and entity trust
-    signals. {intro_tail}
+  <div class="verdict">
+    <h2>{verdict_h}</h2>
+    <p>{verdict_p}</p>
   </div>
 
-  {cat_html}
+  <div class="explain">
+    {internal_tag}
+    <b>What this measures.</b> ChatGPT, Claude, Perplexity and Google's AI Overviews now answer a
+    large share of customer questions directly, naming a handful of businesses instead of listing
+    ten links. This audit tests whether those engines can <b>access</b>, <b>understand</b>, and
+    <b>cite</b> this website. It is not an SEO report: a site can rank well on Google and still be
+    invisible to AI.
+  </div>
+
+  <div class="strip">{strip}</div>
+
+  {roadmap}
+
+  <section class="block">
+    <div class="block-head">
+      <h2>Full breakdown</h2>
+      <div class="block-sub">All {len(checks)} checks, grouped by category.</div>
+    </div>
+    {breakdown}
+  </section>
 
   {closing}
 
-  <footer>Prepared by {brand}. Methodology based on published AI-crawler documentation and
-  peer-reviewed GEO research (Princeton/KDD 2024). Scores reflect the sampled pages on the
-  audit date.</footer>
+  <footer>Prepared by {brand} &nbsp;&bull;&nbsp; {date}. Methodology based on published AI-crawler
+  documentation and peer-reviewed GEO research (Princeton / KDD 2024). Findings reflect the
+  {pages} pages sampled on the audit date; technical findings apply site-wide.</footer>
 </body></html>"""
 
 
