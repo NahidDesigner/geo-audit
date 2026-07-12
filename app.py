@@ -68,6 +68,13 @@ def db():
 
 def init_db():
     with db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS clients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            brand TEXT,
+            notes TEXT,
+            created_at TEXT NOT NULL
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS audits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL,
@@ -98,7 +105,20 @@ def init_db():
             created_at TEXT NOT NULL,
             sent_at TEXT
         )""")
+
+        # --- migrations: add client_id to existing installs without losing data
+        for table in ("audits", "prospects"):
+            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            if "client_id" not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN client_id INTEGER")
+
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prospect_domain ON prospects(domain)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_client ON audits(client_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_prospect_client ON prospects(client_id)")
+        # prospect dedupe is per-client: two clients may legitimately target the
+        # same business, so a global unique index would be wrong.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_prospect_client_domain "
+                     "ON prospects(client_id, domain)")
 
 
 init_db()
@@ -138,6 +158,54 @@ def _sent_today():
             "AND sent_at LIKE ?", (datetime.now().strftime("%Y-%m-%d") + "%",)
         ).fetchone()
     return row["c"]
+
+
+# ---------------------------------------------------------------------------
+# Clients (workspaces) - keep each client's sites in their own tab
+# ---------------------------------------------------------------------------
+
+def all_clients():
+    with db() as conn:
+        return conn.execute(
+            "SELECT c.*, "
+            "(SELECT COUNT(*) FROM audits a WHERE a.client_id=c.id) audit_count "
+            "FROM clients c ORDER BY c.name COLLATE NOCASE").fetchall()
+
+
+def get_client(cid):
+    if not cid:
+        return None
+    with db() as conn:
+        return conn.execute("SELECT * FROM clients WHERE id=?", (cid,)).fetchone()
+
+
+def client_brand(cid):
+    """A client can override the brand shown on their reports (white-labelling)."""
+    c = get_client(cid)
+    if c and c["brand"]:
+        return c["brand"]
+    return DEFAULT_BRAND
+
+
+def _current_client():
+    """Selected client from ?client=N. 0/absent means 'Unassigned'; -1 means All."""
+    raw = request.args.get("client")
+    if raw in (None, ""):
+        return None            # All
+    try:
+        v = int(raw)
+    except ValueError:
+        return None
+    return v                   # 0 = unassigned, N = that client
+
+
+def _client_filter(cid):
+    """SQL fragment + params for filtering by the selected client."""
+    if cid is None:
+        return "", ()
+    if cid == 0:
+        return " WHERE client_id IS NULL", ()
+    return " WHERE client_id=?", (cid,)
 
 
 # ----------------------------------------------------------------------------
@@ -191,6 +259,64 @@ def host_is_public(url):
     return True
 
 
+@app.route("/clients", methods=["GET", "POST"])
+@login_required
+def clients_page():
+    msg = ""
+    if request.method == "POST":
+        name = (request.form.get("name") or "").strip()
+        brand = (request.form.get("brand") or "").strip()
+        notes = (request.form.get("notes") or "").strip()
+        if name:
+            try:
+                with _db_lock, db() as conn:
+                    conn.execute(
+                        "INSERT INTO clients (name,brand,notes,created_at) "
+                        "VALUES (?,?,?,?)",
+                        (name, brand or None, notes or None,
+                         datetime.now().strftime("%Y-%m-%d %H:%M")))
+                msg = f"Client '{name}' created."
+            except sqlite3.IntegrityError:
+                msg = f"A client named '{name}' already exists."
+    return render_template_string(CLIENTS_TMPL, clients=all_clients(), msg=msg,
+                                  default_brand=DEFAULT_BRAND)
+
+
+@app.route("/clients/<int:cid>/edit", methods=["POST"])
+@login_required
+def client_edit(cid):
+    name = (request.form.get("name") or "").strip()
+    brand = (request.form.get("brand") or "").strip()
+    notes = (request.form.get("notes") or "").strip()
+    if name:
+        with _db_lock, db() as conn:
+            conn.execute("UPDATE clients SET name=?, brand=?, notes=? WHERE id=?",
+                         (name, brand or None, notes or None, cid))
+    return redirect(url_for("clients_page"))
+
+
+@app.route("/clients/<int:cid>/delete", methods=["POST"])
+@login_required
+def client_delete(cid):
+    """Delete the client only. Their audits/prospects are kept and become
+    unassigned - deleting a workspace should never destroy audit history."""
+    with _db_lock, db() as conn:
+        conn.execute("UPDATE audits SET client_id=NULL WHERE client_id=?", (cid,))
+        conn.execute("UPDATE prospects SET client_id=NULL WHERE client_id=?", (cid,))
+        conn.execute("DELETE FROM clients WHERE id=?", (cid,))
+    return redirect(url_for("clients_page"))
+
+
+@app.route("/audits/<int:audit_id>/assign", methods=["POST"])
+@login_required
+def audit_assign(audit_id):
+    raw = request.form.get("client_id") or ""
+    cid = int(raw) if raw.isdigit() and int(raw) > 0 else None
+    with _db_lock, db() as conn:
+        conn.execute("UPDATE audits SET client_id=? WHERE id=?", (cid, audit_id))
+    return redirect(request.referrer or url_for("index"))
+
+
 # ----------------------------------------------------------------------------
 # Audit runner (background thread)
 # ----------------------------------------------------------------------------
@@ -217,43 +343,60 @@ def run_audit_job(audit_id, url, brand, max_pages):
 @app.route("/", methods=["GET"])
 @login_required
 def index():
+    cid = _current_client()
+    where, params = _client_filter(cid)
     with db() as conn:
-        rows = conn.execute("SELECT * FROM audits ORDER BY id DESC LIMIT 200").fetchall()
+        rows = conn.execute(
+            f"SELECT * FROM audits{where} ORDER BY id DESC LIMIT 200",
+            params).fetchall()
+        counts = {
+            "all": conn.execute("SELECT COUNT(*) c FROM audits").fetchone()["c"],
+            "unassigned": conn.execute(
+                "SELECT COUNT(*) c FROM audits WHERE client_id IS NULL"
+            ).fetchone()["c"],
+        }
     running = any(r["status"] == "running" for r in rows)
-    return render_template_string(INDEX_TMPL, rows=rows, running=running,
-                                  default_brand=DEFAULT_BRAND)
+    return render_template_string(
+        INDEX_TMPL, rows=rows, running=running,
+        default_brand=client_brand(cid) if cid else DEFAULT_BRAND,
+        clients=all_clients(), cid=cid, counts=counts,
+        sel_client=get_client(cid) if cid else None)
 
 
 @app.route("/run", methods=["POST"])
 @login_required
 def run():
     url = (request.form.get("url") or "").strip()
-    brand = (request.form.get("brand") or DEFAULT_BRAND).strip() or DEFAULT_BRAND
+    raw_cid = request.form.get("client_id") or ""
+    cid = int(raw_cid) if raw_cid.isdigit() and int(raw_cid) > 0 else None
+    brand = (request.form.get("brand") or "").strip() or client_brand(cid)
     try:
         max_pages = max(2, min(int(request.form.get("max_pages", 6)), 25))
     except ValueError:
         max_pages = 6
     if not url:
-        return redirect(url_for("index"))
+        return redirect(url_for("index", client=raw_cid or None))
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     if not host_is_public(url):
         with db() as conn:
-            conn.execute("INSERT INTO audits (url,brand,max_pages,status,error,created_at) "
-                         "VALUES (?,?,?,?,?,?)",
+            conn.execute("INSERT INTO audits (url,brand,max_pages,status,error,"
+                         "created_at,client_id) VALUES (?,?,?,?,?,?,?)",
                          (url, brand, max_pages, "error",
                           "Host is not a public website (or DNS failed).",
-                          datetime.now().strftime("%Y-%m-%d %H:%M")))
-        return redirect(url_for("index"))
+                          datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
+        return redirect(url_for("index", client=raw_cid or None))
 
     with _db_lock, db() as conn:
         cur = conn.execute(
-            "INSERT INTO audits (url,brand,max_pages,status,created_at) VALUES (?,?,?,?,?)",
-            (url, brand, max_pages, "running", datetime.now().strftime("%Y-%m-%d %H:%M")))
+            "INSERT INTO audits (url,brand,max_pages,status,created_at,client_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (url, brand, max_pages, "running",
+             datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
         audit_id = cur.lastrowid
     threading.Thread(target=run_audit_job, args=(audit_id, url, brand, max_pages),
                      daemon=True).start()
-    return redirect(url_for("index"))
+    return redirect(url_for("index", client=raw_cid or None))
 
 
 VARIANT_SUFFIX = {"internal": "", "client": "-client", "guide": "-guide"}
@@ -328,10 +471,10 @@ def process_prospect(pid, brand, max_pages, auto_send):
         _upd(pid, status="auditing")
         with _db_lock, db() as conn:
             cur = conn.execute(
-                "INSERT INTO audits (url,brand,max_pages,status,created_at) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO audits (url,brand,max_pages,status,created_at,client_id) "
+                "VALUES (?,?,?,?,?,?)",
                 (p["website"], brand, max_pages, "running",
-                 datetime.now().strftime("%Y-%m-%d %H:%M")))
+                 datetime.now().strftime("%Y-%m-%d %H:%M"), p["client_id"]))
             audit_id = cur.lastrowid
         out_base = os.path.join(REPORT_DIR, str(audit_id))
         try:
@@ -392,25 +535,30 @@ def process_batch(pids, brand, max_pages, auto_send):
 @app.route("/prospects")
 @login_required
 def prospects_page():
+    cid = _current_client()
+    where, params = _client_filter(cid)
     with db() as conn:
         rows = conn.execute(
-            "SELECT * FROM prospects ORDER BY id DESC LIMIT 300").fetchall()
-    busy = any(r["status"] in ("auditing", "found") and r["status"] == "auditing"
-               for r in rows)
+            f"SELECT * FROM prospects{where} ORDER BY id DESC LIMIT 300",
+            params).fetchall()
     running = any(r["status"] == "auditing" for r in rows)
     return render_template_string(
         PROSPECTS_TMPL, rows=rows, running=running,
         places_ok=PLACES_OK, llm_ok=LLM_OK, smtp_ok=SMTP_OK,
         auto_send_master=AUTO_SEND_MASTER, cap=SEND_DAILY_CAP,
-        sent_today=_sent_today(), default_brand=DEFAULT_BRAND)
+        sent_today=_sent_today(), default_brand=DEFAULT_BRAND,
+        clients=all_clients(), cid=cid,
+        sel_client=get_client(cid) if cid else None)
 
 
 @app.route("/prospects/search", methods=["POST"])
 @login_required
 def prospects_search():
     query = (request.form.get("query") or "").strip()
+    raw_cid = request.form.get("client_id") or ""
+    cid = int(raw_cid) if raw_cid.isdigit() and int(raw_cid) > 0 else None
     if not query or not PLACES_OK:
-        return redirect(url_for("prospects_page"))
+        return redirect(url_for("prospects_page", client=raw_cid or None))
     try:
         max_r = max(1, min(int(request.form.get("max_results", 20)), 60))
     except ValueError:
@@ -420,29 +568,35 @@ def prospects_search():
     except Exception as e:
         with _db_lock, db() as conn:
             conn.execute(
-                "INSERT INTO prospects (name,website,domain,status,error,created_at) "
-                "VALUES (?,?,?,?,?,?)",
+                "INSERT INTO prospects (name,website,domain,status,error,created_at,"
+                "client_id) VALUES (?,?,?,?,?,?,?)",
                 (f"Search failed: {query}", "-", "-", "error", str(e)[:300],
-                 datetime.now().strftime("%Y-%m-%d %H:%M")))
-        return redirect(url_for("prospects_page"))
+                 datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
+        return redirect(url_for("prospects_page", client=raw_cid or None))
 
-    added = 0
     with _db_lock, db() as conn:
         for r in results:
             domain = urlparse(r["website"]).netloc.lower().removeprefix("www.")
             if not domain:
                 continue
-            dup = conn.execute("SELECT 1 FROM prospects WHERE domain=?",
-                               (domain,)).fetchone()
+            # dedupe within this client's list only - two clients may legitimately
+            # target the same business
+            if cid is None:
+                dup = conn.execute(
+                    "SELECT 1 FROM prospects WHERE domain=? AND client_id IS NULL",
+                    (domain,)).fetchone()
+            else:
+                dup = conn.execute(
+                    "SELECT 1 FROM prospects WHERE domain=? AND client_id=?",
+                    (domain, cid)).fetchone()
             if dup:
                 continue
             conn.execute(
                 "INSERT INTO prospects (place_id,name,website,domain,address,"
-                "status,created_at) VALUES (?,?,?,?,?,?,?)",
+                "status,created_at,client_id) VALUES (?,?,?,?,?,?,?,?)",
                 (r["place_id"], r["name"], r["website"], domain, r["address"],
-                 "found", datetime.now().strftime("%Y-%m-%d %H:%M")))
-            added += 1
-    return redirect(url_for("prospects_page"))
+                 "found", datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
+    return redirect(url_for("prospects_page", client=raw_cid or None))
 
 
 @app.route("/prospects/process", methods=["POST"])
@@ -450,19 +604,24 @@ def prospects_search():
 def prospects_process():
     ids = [int(i) for i in request.form.getlist("ids")]
     auto_send = request.form.get("auto_send") == "1"
+    raw_cid = request.form.get("client_id") or ""
+    cid = int(raw_cid) if raw_cid.isdigit() and int(raw_cid) > 0 else None
     try:
         max_pages = max(2, min(int(request.form.get("max_pages", 6)), 15))
     except ValueError:
         max_pages = 6
     if not ids:
+        where = " AND client_id=?" if cid else " AND client_id IS NULL" if raw_cid == "0" else ""
+        params = (cid,) if cid else ()
         with db() as conn:
             ids = [r["id"] for r in conn.execute(
-                "SELECT id FROM prospects WHERE status='found' ORDER BY id"
-            ).fetchall()][:25]
+                f"SELECT id FROM prospects WHERE status='found'{where} ORDER BY id",
+                params).fetchall()][:25]
+    brand = client_brand(cid) if cid else DEFAULT_BRAND
     threading.Thread(target=process_batch,
-                     args=(ids, DEFAULT_BRAND, max_pages, auto_send),
+                     args=(ids, brand, max_pages, auto_send),
                      daemon=True).start()
-    return redirect(url_for("prospects_page"))
+    return redirect(url_for("prospects_page", client=raw_cid or None))
 
 
 @app.route("/prospects/email/<int:pid>", methods=["GET", "POST"])
@@ -529,6 +688,23 @@ def _audit_summary(row):
             **({"error": row["error"]} if row["error"] else {})}
 
 
+def _client_id_by_name(name):
+    """Resolve a client name to its id. Returns (id, error_message)."""
+    name = (name or "").strip()
+    if not name:
+        return None, None
+    with db() as conn:
+        r = conn.execute("SELECT id FROM clients WHERE name=? COLLATE NOCASE",
+                         (name,)).fetchone()
+    if not r:
+        with db() as conn:
+            avail = [x["name"] for x in conn.execute("SELECT name FROM clients")]
+        return None, (f"No client named '{name}'. Existing clients: "
+                      f"{', '.join(avail) if avail else '(none)'}. "
+                      "Use create_client first.")
+    return r["id"], None
+
+
 def _mcp_call(name, args):
     """Dispatch one MCP tool call. Returns an MCP tool result dict."""
 
@@ -540,15 +716,18 @@ def _mcp_call(name, args):
             url = "https://" + url
         if not host_is_public(url):
             return MCP._fail("That host is not a reachable public website.")
-        brand = (args.get("brand") or DEFAULT_BRAND).strip() or DEFAULT_BRAND
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
+        brand = (args.get("brand") or "").strip() or client_brand(cid)
         max_pages = max(2, min(int(args.get("max_pages") or 8), 15))
 
         with _db_lock, db() as conn:
             cur = conn.execute(
-                "INSERT INTO audits (url,brand,max_pages,status,created_at) "
-                "VALUES (?,?,?,?,?)",
+                "INSERT INTO audits (url,brand,max_pages,status,created_at,client_id) "
+                "VALUES (?,?,?,?,?,?)",
                 (url, brand, max_pages, "running",
-                 datetime.now().strftime("%Y-%m-%d %H:%M")))
+                 datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
             aid = cur.lastrowid
         # run synchronously: the chat is waiting for the answer
         try:
@@ -593,9 +772,17 @@ def _mcp_call(name, args):
 
     if name == "list_audits":
         limit = max(1, min(int(args.get("limit") or 15), 50))
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
         with db() as conn:
-            rows = conn.execute(
-                "SELECT * FROM audits ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            if cid:
+                rows = conn.execute(
+                    "SELECT * FROM audits WHERE client_id=? ORDER BY id DESC LIMIT ?",
+                    (cid, limit)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM audits ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return MCP._text(json.dumps([_audit_summary(r) for r in rows], indent=2))
 
     if name == "get_audit":
@@ -640,6 +827,9 @@ def _mcp_call(name, args):
         if not query:
             return MCP._fail("A query is required.")
         n = max(1, min(int(args.get("max_results") or 10), 60))
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
         try:
             results = P.search_places(query, PLACES_KEY, n)
         except Exception as e:
@@ -650,15 +840,22 @@ def _mcp_call(name, args):
                 domain = urlparse(r["website"]).netloc.lower().removeprefix("www.")
                 if not domain:
                     continue
-                if conn.execute("SELECT 1 FROM prospects WHERE domain=?",
-                                (domain,)).fetchone():
+                if cid:
+                    dup = conn.execute(
+                        "SELECT 1 FROM prospects WHERE domain=? AND client_id=?",
+                        (domain, cid)).fetchone()
+                else:
+                    dup = conn.execute(
+                        "SELECT 1 FROM prospects WHERE domain=? AND client_id IS NULL",
+                        (domain,)).fetchone()
+                if dup:
                     skipped += 1
                     continue
                 cur = conn.execute(
                     "INSERT INTO prospects (place_id,name,website,domain,address,"
-                    "status,created_at) VALUES (?,?,?,?,?,?,?)",
+                    "status,created_at,client_id) VALUES (?,?,?,?,?,?,?,?)",
                     (r["place_id"], r["name"], r["website"], domain, r["address"],
-                     "found", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                     "found", datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
                 added.append({"prospect_id": cur.lastrowid, "name": r["name"],
                               "website": r["website"]})
         return MCP._text(json.dumps(
@@ -747,6 +944,43 @@ def _mcp_call(name, args):
                     "sending is not available through this connector.",
         }, indent=2))
 
+    if name == "list_clients":
+        return MCP._text(json.dumps([{
+            "name": c["name"], "brand": c["brand"] or DEFAULT_BRAND,
+            "audits": c["audit_count"], "notes": c["notes"],
+        } for c in all_clients()], indent=2))
+
+    if name == "create_client":
+        cname = (args.get("name") or "").strip()
+        if not cname:
+            return MCP._fail("A client name is required.")
+        try:
+            with _db_lock, db() as conn:
+                conn.execute("INSERT INTO clients (name,brand,notes,created_at) "
+                             "VALUES (?,?,?,?)",
+                             (cname, (args.get("brand") or "").strip() or None,
+                              (args.get("notes") or "").strip() or None,
+                              datetime.now().strftime("%Y-%m-%d %H:%M")))
+        except sqlite3.IntegrityError:
+            return MCP._fail(f"A client named '{cname}' already exists.")
+        return MCP._text(json.dumps({"created": cname}, indent=2))
+
+    if name == "assign_audit":
+        aid = int(args.get("audit_id") or 0)
+        cname = (args.get("client") or "").strip()
+        cid = None
+        if cname:
+            cid, err = _client_id_by_name(cname)
+            if err:
+                return MCP._fail(err)
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM audits WHERE id=?", (aid,)).fetchone():
+                return MCP._fail(f"No audit with id {aid}.")
+        with _db_lock, db() as conn:
+            conn.execute("UPDATE audits SET client_id=? WHERE id=?", (cid, aid))
+        return MCP._text(json.dumps(
+            {"audit_id": aid, "client": cname or "(unassigned)"}, indent=2))
+
     return MCP._fail(f"Unknown tool: {name}")
 
 
@@ -813,6 +1047,19 @@ BASE_CSS = """
             color:#93c5fd; font-size:13px; font-weight:600; }
   .tabs a.on { background:rgba(255,255,255,.14); color:#fff; }
   .tabs a:hover { color:#fff; }
+  .clientbar { display:flex; gap:6px; flex-wrap:wrap; align-items:center;
+               margin-bottom:18px; }
+  .cbtn { display:inline-block; padding:6px 14px; border-radius:20px; font-size:13px;
+          font-weight:600; text-decoration:none; color:#475569; background:#fff;
+          border:1px solid #e2e8f0; white-space:nowrap; }
+  .cbtn:hover { border-color:#94a3b8; }
+  .cbtn.on { background:#0f172a; color:#fff; border-color:#0f172a; }
+  .cbtn .n { opacity:.6; font-weight:400; margin-left:4px; }
+  .cbtn.manage { color:#1d4ed8; border-style:dashed; }
+  .ctx { background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;
+         padding:9px 14px; margin-bottom:14px; font-size:13px; color:#1e3a8a; }
+  select { width:100%; padding:10px 12px; border:1px solid #cbd5e1;
+           border-radius:8px; font-size:14px; background:#fff; }
   .card { background:#fff; border:1px solid #e2e8f0; border-radius:12px;
           padding:20px; margin-bottom:20px; }
   label { display:block; font-size:12px; font-weight:700; color:#475569;
@@ -878,11 +1125,29 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <nav class="tabs">
       <a class="on" href="{{ url_for('index') }}">Audits</a>
       <a href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a href="{{ url_for('clients_page') }}">Clients</a>
     </nav>
   </div>
   <a href="{{ url_for('logout') }}">Log out</a>
 </div></div>
 <div class="wrap">
+
+  <div class="clientbar">
+    <a class="cbtn {{ 'on' if cid is none }}" href="{{ url_for('index') }}">All<span class="n">{{ counts['all'] if counts else '' }}</span></a>
+    <a class="cbtn {{ 'on' if cid == 0 }}" href="{{ url_for('index', client=0) }}">Unassigned{% if counts %}<span class="n">{{ counts['unassigned'] }}</span>{% endif %}</a>
+    {% for c in clients %}
+      <a class="cbtn {{ 'on' if cid == c['id'] }}" href="{{ url_for('index', client=c['id']) }}">{{ c['name'] }}<span class="n">{{ c['audit_count'] }}</span></a>
+    {% endfor %}
+    <a class="cbtn manage" href="{{ url_for('clients_page') }}">+ Manage clients</a>
+  </div>
+  {% if sel_client %}
+    <div class="ctx"><b>{{ sel_client['name'] }}</b>
+      &mdash; new audits here are tagged to this client{% if sel_client['brand'] %},
+      and reports are branded <b>{{ sel_client['brand'] }}</b>{% endif %}.
+      {% if sel_client['notes'] %}<br>{{ sel_client['notes'] }}{% endif %}
+    </div>
+  {% endif %}
+
   <div class="card">
     <form method="post" action="{{ url_for('run') }}">
       <div class="row">
@@ -891,10 +1156,19 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
           <input type="text" name="url" placeholder="clientsite.com" required>
         </div>
         <div style="flex:2">
+          <label>Client</label>
+          <select name="client_id">
+            <option value="">&mdash; Unassigned &mdash;</option>
+            {% for c in clients %}
+              <option value="{{ c['id'] }}" {{ 'selected' if cid == c['id'] }}>{{ c['name'] }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div style="flex:2">
           <label>Brand on report</label>
           <input type="text" name="brand" value="{{ default_brand }}">
         </div>
-        <div style="flex:0 0 110px">
+        <div style="flex:0 0 100px">
           <label>Pages</label>
           <input type="number" name="max_pages" value="8" min="2" max="25">
         </div>
@@ -905,7 +1179,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
   <div class="card">
     <table>
-      <tr><th>Site</th><th>Date</th><th>Score</th><th>Status</th>
+      <tr><th>Site</th><th>Client</th><th>Date</th><th>Score</th><th>Status</th>
           <th>Internal <span style="text-transform:none;letter-spacing:0">(with fixes)</span></th>
           <th>Client <span style="text-transform:none;letter-spacing:0">(findings only)</span></th>
           <th>Guide <span style="text-transform:none;letter-spacing:0">(sellable)</span></th>
@@ -913,6 +1187,17 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
       {% for r in rows %}
       <tr>
         <td><strong>{{ r['url'].replace('https://','').replace('http://','') }}</strong></td>
+        <td>
+          <form method="post" action="{{ url_for('audit_assign', audit_id=r['id']) }}" style="margin:0">
+            <select name="client_id" onchange="this.form.submit()"
+                    style="padding:4px 8px;font-size:12px;border-radius:6px">
+              <option value="">&mdash;</option>
+              {% for c in clients %}
+                <option value="{{ c['id'] }}" {{ 'selected' if r['client_id'] == c['id'] }}>{{ c['name'] }}</option>
+              {% endfor %}
+            </select>
+          </form>
+        </td>
         <td>{{ r['created_at'] }}</td>
         <td>
           {% if r['score'] is not none %}
@@ -955,7 +1240,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         </td>
       </tr>
       {% endfor %}
-      {% if not rows %}<tr><td colspan="8" style="color:#94a3b8">
+      {% if not rows %}<tr><td colspan="9" style="color:#94a3b8">
         No audits yet. Enter a URL above and click Run Audit.</td></tr>{% endif %}
     </table>
   </div>
@@ -989,11 +1274,25 @@ PROSPECTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <nav class="tabs">
       <a href="{{ url_for('index') }}">Audits</a>
       <a class="on" href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a href="{{ url_for('clients_page') }}">Clients</a>
     </nav>
   </div>
   <a href="{{ url_for('logout') }}">Log out</a>
 </div></div>
 <div class="wrap">
+
+  <div class="clientbar">
+    <a class="cbtn {{ 'on' if cid is none }}" href="{{ url_for('prospects_page') }}">All</a>
+    <a class="cbtn {{ 'on' if cid == 0 }}" href="{{ url_for('prospects_page', client=0) }}">Unassigned</a>
+    {% for c in clients %}
+      <a class="cbtn {{ 'on' if cid == c['id'] }}" href="{{ url_for('prospects_page', client=c['id']) }}">{{ c['name'] }}</a>
+    {% endfor %}
+    <a class="cbtn manage" href="{{ url_for('clients_page') }}">+ Manage clients</a>
+  </div>
+  {% if sel_client %}
+    <div class="ctx">Prospects here belong to <b>{{ sel_client['name'] }}</b>.
+      Duplicate businesses are only blocked within this client's list.</div>
+  {% endif %}
 
   <div class="cfg">
     <span class="{{ 'ok' if places_ok else 'off' }}">Google Places {{ 'connected' if places_ok else 'not configured' }}</span>
@@ -1004,6 +1303,7 @@ PROSPECTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
   <div class="card">
     <form method="post" action="{{ url_for('prospects_search') }}">
+      <input type="hidden" name="client_id" value="{{ cid if cid else '' }}">
       <div class="row">
         <div style="flex:3">
           <label>Find businesses (Google Places search)</label>
@@ -1023,6 +1323,7 @@ PROSPECTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
 
   <div class="card">
     <form method="post" action="{{ url_for('prospects_process') }}">
+      <input type="hidden" name="client_id" value="{{ cid if cid else '' }}">
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
         <div>
           <button type="submit">Audit &amp; Draft Selected</button>
@@ -1130,6 +1431,102 @@ EMAIL_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         {% if not smtp_ok %}<span style="color:#94a3b8;font-size:12px;align-self:center">SMTP not configured</span>{% endif %}
       </div>
     </form>
+  </div>
+</div></body></html>"""
+
+
+CLIENTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clients - GEO Audit</title>
+<style>""" + BASE_CSS + """
+  .cl { border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px;
+        margin-bottom:10px; }
+  .cl-head { display:flex; justify-content:space-between; align-items:center;
+             margin-bottom:8px; }
+  .cl-name { font-size:16px; font-weight:700; }
+  .cl-meta { color:#64748b; font-size:12px; }
+  .msg { background:#f0fdf4; border:1px solid #bbf7d0; color:#15803d;
+         border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+  details summary { cursor:pointer; color:#1d4ed8; font-size:12px;
+                    font-weight:600; margin-top:6px; }
+</style></head><body>
+<div class="topbar"><div class="wrap">
+  <div style="display:flex;align-items:center;gap:22px">
+    <h1>AI Visibility Audit</h1>
+    <nav class="tabs">
+      <a href="{{ url_for('index') }}">Audits</a>
+      <a href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a class="on" href="{{ url_for('clients_page') }}">Clients</a>
+    </nav>
+  </div>
+  <a href="{{ url_for('logout') }}">Log out</a>
+</div></div>
+<div class="wrap">
+  {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+
+  <div class="card">
+    <form method="post">
+      <div class="row">
+        <div style="flex:2">
+          <label>Client name</label>
+          <input type="text" name="name" placeholder="e.g. Bosseo, or Weber Law" required>
+        </div>
+        <div style="flex:2">
+          <label>Report brand <span style="font-weight:400;color:#94a3b8">(optional &mdash; white-label)</span></label>
+          <input type="text" name="brand" placeholder="{{ default_brand }}">
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <label>Notes <span style="font-weight:400;color:#94a3b8">(optional)</span></label>
+        <input type="text" name="notes" placeholder="Anything you want to remember about this client">
+      </div>
+      <div style="margin-top:14px"><button type="submit">Add Client</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    {% for c in clients %}
+    <div class="cl">
+      <div class="cl-head">
+        <div>
+          <div class="cl-name">{{ c['name'] }}</div>
+          <div class="cl-meta">
+            {{ c['audit_count'] }} audit{{ '' if c['audit_count']==1 else 's' }}
+            {% if c['brand'] %}&nbsp;&bull;&nbsp; reports branded &ldquo;{{ c['brand'] }}&rdquo;{% endif %}
+            {% if c['notes'] %}<br>{{ c['notes'] }}{% endif %}
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <a href="{{ url_for('index', client=c['id']) }}"
+             style="color:#1d4ed8;text-decoration:none;font-weight:600;font-size:13px">Open &rarr;</a>
+          <form method="post" action="{{ url_for('client_delete', cid=c['id']) }}" style="margin:0"
+                onsubmit="return confirm('Delete this client? Their audits are KEPT and become Unassigned.')">
+            <button class="danger" type="submit">Delete</button>
+          </form>
+        </div>
+      </div>
+      <details>
+        <summary>Edit</summary>
+        <form method="post" action="{{ url_for('client_edit', cid=c['id']) }}" style="margin-top:8px">
+          <div class="row">
+            <div><label>Name</label><input type="text" name="name" value="{{ c['name'] }}"></div>
+            <div><label>Report brand</label><input type="text" name="brand" value="{{ c['brand'] or '' }}"></div>
+          </div>
+          <div style="margin-top:8px">
+            <label>Notes</label>
+            <input type="text" name="notes" value="{{ c['notes'] or '' }}">
+          </div>
+          <div style="margin-top:10px"><button type="submit">Save</button></div>
+        </form>
+      </details>
+    </div>
+    {% endfor %}
+    {% if not clients %}
+      <div style="color:#94a3b8;font-size:13px">
+        No clients yet. Add one above &mdash; then audits and prospects can be filed
+        under it and kept separate from everything else.
+      </div>
+    {% endif %}
   </div>
 </div></body></html>"""
 

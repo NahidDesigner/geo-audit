@@ -19,6 +19,22 @@ PDF reports. Built for deployment on Coolify.
    automatically.
 6. **Deploy**. Open the app URL, log in with your password.
 
+## Clients (workspaces)
+
+Keep each client's sites separate. The **Clients** tab creates workspaces; audits
+and prospects are filed under one, and the client tab bar filters everything to
+that client. Useful when one client has 30+ sites you don't want mixed in with
+everyone else's.
+
+- **Per-client brand** (optional): set a brand on a client and their reports are
+  white-labelled with it instead of `GEO_BRAND`.
+- **Prospect dedupe is per-client**, not global - two clients may legitimately
+  target the same business.
+- **Deleting a client never deletes audits.** Their audits and prospects are kept
+  and moved to Unassigned.
+- Existing audits from before this feature are migrated automatically and appear
+  under **Unassigned**.
+
 ## Prospecting (optional - each feature enables when its vars are set)
 
 The Prospecting tab finds businesses, audits their sites, harvests a contact

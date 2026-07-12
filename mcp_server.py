@@ -33,7 +33,12 @@ TOOLS = [
                               "description": "Pages to sample (2-15). Default 8."},
                 "brand": {"type": "string",
                           "description": "Brand name shown on the report. "
-                                         "Defaults to the dashboard's brand."},
+                                         "Defaults to the client's brand, or the "
+                                         "dashboard's brand."},
+                "client": {"type": "string",
+                           "description": "Client/workspace name to file this audit "
+                                          "under, e.g. 'Bosseo'. Must already exist "
+                                          "(see list_clients). Omit for unassigned."},
             },
             "required": ["url"],
         },
@@ -47,6 +52,8 @@ TOOLS = [
             "properties": {
                 "limit": {"type": "integer", "default": 15,
                           "description": "How many to return (1-50)."},
+                "client": {"type": "string",
+                           "description": "Only show audits for this client."},
             },
         },
     },
@@ -90,6 +97,9 @@ TOOLS = [
                           "description": "e.g. 'personal injury lawyers in Denver, CO'"},
                 "max_results": {"type": "integer", "default": 10,
                                 "description": "1-60. Default 10."},
+                "client": {"type": "string",
+                           "description": "Client/workspace to file these prospects "
+                                          "under. Deduplication is per-client."},
             },
             "required": ["query"],
         },
@@ -147,6 +157,40 @@ TOOLS = [
                 "to": {"type": "string", "description": "Recipient email address."},
             },
             "required": ["prospect_id"],
+        },
+    },
+    {
+        "name": "list_clients",
+        "description": ("List client workspaces. Audits and prospects can be filed "
+                        "under a client to keep each client's sites separate."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "create_client",
+        "description": ("Create a client workspace. Optionally set a brand, which "
+                        "white-labels the reports generated for that client."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "e.g. 'Bosseo'"},
+                "brand": {"type": "string",
+                          "description": "Optional. Brand shown on this client's reports."},
+                "notes": {"type": "string", "description": "Optional."},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "assign_audit",
+        "description": "Move an existing audit into a client workspace.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "audit_id": {"type": "integer"},
+                "client": {"type": "string",
+                           "description": "Client name. Empty string unassigns it."},
+            },
+            "required": ["audit_id", "client"],
         },
     },
 ]
