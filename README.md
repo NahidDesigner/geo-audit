@@ -70,12 +70,23 @@ chatting with Claude - from desktop or phone.
 2. In Coolify add two environment variables:
    - `MCP_TOKEN` = that token
    - `PUBLIC_URL` = your dashboard's public address, e.g. `https://audit.yourdomain.com`
-3. Redeploy. Your MCP endpoint is now:
-   `https://audit.yourdomain.com/mcp/YOUR_MCP_TOKEN`
-4. In Claude: **Settings -> Connectors -> Add custom connector**, paste that URL.
+3. Redeploy.
+4. In Claude: **Settings -> Connectors -> Add custom connector**, paste:
+   `https://audit.yourdomain.com/mcp`
+   Leave the OAuth Client ID and Secret blank. Claude will open a page asking
+   for your dashboard password - enter `GEO_PASSWORD` and approve.
 
-The token is the only thing protecting the endpoint, so treat the URL like a
-password. If `MCP_TOKEN` is unset the endpoint returns 404 and MCP is off.
+`PUBLIC_URL` must be set and correct, since the OAuth metadata is built from it.
+
+**Two auth methods are supported:**
+- **OAuth** (`/mcp`) - what Claude.ai's custom connector uses. Claude.ai forces
+  OAuth discovery on every connector and fails if the `.well-known` endpoints
+  404, so the server implements OAuth 2.1 + PKCE + Dynamic Client Registration.
+  Approval requires your dashboard password.
+- **Path token** (`/mcp/YOUR_MCP_TOKEN`) - simpler, for Claude Code, curl, and
+  the MCP Inspector. `Authorization: Bearer YOUR_MCP_TOKEN` also works.
+
+If `MCP_TOKEN` is unset, MCP and all OAuth endpoints return 404.
 
 **Tools available in chat**
 

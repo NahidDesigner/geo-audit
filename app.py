@@ -13,6 +13,8 @@ Configuration (environment variables, set by the systemd service):
     GEO_ALLOW_PRIVATE   set to 1 to allow auditing localhost/private IPs (testing only)
 """
 
+import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -20,6 +22,7 @@ import secrets
 import socket
 import sqlite3
 import threading
+import time
 import traceback
 from datetime import datetime
 from functools import wraps
@@ -984,11 +987,29 @@ def _mcp_call(name, args):
     return MCP._fail(f"Unknown tool: {name}")
 
 
+@app.route("/mcp", methods=["POST", "GET", "DELETE"])
 @app.route("/mcp/<token>", methods=["POST", "GET", "DELETE"])
-def mcp_endpoint(token):
-    """MCP Streamable HTTP endpoint. The secret lives in the path."""
-    if not MCP_TOKEN or not secrets.compare_digest(token, MCP_TOKEN):
+def mcp_endpoint(token=None):
+    """MCP Streamable HTTP endpoint.
+
+    Two ways to authenticate:
+      1. The secret in the path (/mcp/<MCP_TOKEN>) - simple, works with curl,
+         Claude Code, and the MCP Inspector.
+      2. An OAuth Bearer token - what Claude.ai's custom connector uses, since
+         it forces OAuth on every connector.
+    """
+    if not MCP_TOKEN:
         return Response("Not found", status=404)
+
+    path_ok = bool(token) and secrets.compare_digest(token, MCP_TOKEN)
+    if not (path_ok or _bearer_ok()):
+        # Point unauthenticated clients at the OAuth metadata so discovery works.
+        resp = Response(json.dumps({"error": "unauthorized"}), status=401,
+                        mimetype="application/json")
+        resp.headers["WWW-Authenticate"] = (
+            'Bearer resource_metadata='
+            f'"{_base_url()}/.well-known/oauth-protected-resource"')
+        return resp
 
     if request.method in ("GET", "DELETE"):
         # No server-initiated streaming and no sessions to terminate.
@@ -1026,6 +1047,206 @@ def mcp_endpoint(token):
             return jsonify(MCP._ok(rid, MCP._fail(f"{type(e).__name__}: {e}")))
 
     return jsonify(MCP._err(rid, -32601, f"Method not found: {method}"))
+
+
+# ----------------------------------------------------------------------------
+# OAuth 2.1 for the MCP connector
+#
+# Claude.ai's custom-connector flow runs OAuth discovery + Dynamic Client
+# Registration against every server and aborts if the .well-known endpoints
+# 404 - even for servers that need no auth at all (anthropics/claude-ai-mcp
+# #402, #457). So we implement the minimum viable OAuth 2.1 + PKCE + DCR.
+#
+# The security model is unchanged: the human approving the authorize step must
+# know GEO_PASSWORD. Clients are registered dynamically and tokens are stored
+# in the same SQLite database.
+# ----------------------------------------------------------------------------
+
+def init_oauth_db():
+    with db() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_clients (
+            client_id TEXT PRIMARY KEY,
+            redirect_uris TEXT NOT NULL,
+            name TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_codes (
+            code TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            code_challenge TEXT,
+            expires_at REAL NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS oauth_tokens (
+            token TEXT PRIMARY KEY,
+            client_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+
+
+init_oauth_db()
+
+
+def _base_url():
+    """External base URL. PUBLIC_URL wins; otherwise derive from the request."""
+    if PUBLIC_URL:
+        return PUBLIC_URL
+    return request.url_root.rstrip("/").replace("http://", "https://", 1)
+
+
+def _oauth_enabled():
+    return bool(MCP_TOKEN)
+
+
+@app.route("/.well-known/oauth-protected-resource")
+@app.route("/.well-known/oauth-protected-resource/<path:_p>")
+def oauth_protected_resource(_p=None):
+    if not _oauth_enabled():
+        abort(404)
+    base = _base_url()
+    return jsonify({
+        "resource": base,
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+@app.route("/.well-known/oauth-authorization-server")
+@app.route("/.well-known/oauth-authorization-server/<path:_p>")
+@app.route("/.well-known/openid-configuration")
+def oauth_authorization_server(_p=None):
+    if not _oauth_enabled():
+        abort(404)
+    base = _base_url()
+    return jsonify({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/oauth/authorize",
+        "token_endpoint": f"{base}/oauth/token",
+        "registration_endpoint": f"{base}/oauth/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
+    })
+
+
+@app.route("/oauth/register", methods=["POST"])
+def oauth_register():
+    """Dynamic Client Registration (RFC 7591). Open by design - possession of a
+    client_id grants nothing; the authorize step still requires the password."""
+    if not _oauth_enabled():
+        abort(404)
+    body = request.get_json(silent=True) or {}
+    uris = body.get("redirect_uris") or []
+    if not isinstance(uris, list) or not uris:
+        return jsonify({"error": "invalid_redirect_uri"}), 400
+    cid = "geo-" + secrets.token_urlsafe(18)
+    with _db_lock, db() as conn:
+        conn.execute("INSERT INTO oauth_clients (client_id,redirect_uris,name,"
+                     "created_at) VALUES (?,?,?,?)",
+                     (cid, json.dumps(uris), body.get("client_name", "")[:100],
+                      datetime.now().strftime("%Y-%m-%d %H:%M")))
+    return jsonify({
+        "client_id": cid,
+        "redirect_uris": uris,
+        "token_endpoint_auth_method": "none",
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+    }), 201
+
+
+@app.route("/oauth/authorize", methods=["GET", "POST"])
+def oauth_authorize():
+    if not _oauth_enabled():
+        abort(404)
+    args = request.args if request.method == "GET" else request.form
+    cid = args.get("client_id", "")
+    redirect_uri = args.get("redirect_uri", "")
+    state = args.get("state", "")
+    challenge = args.get("code_challenge", "")
+
+    with db() as conn:
+        client = conn.execute("SELECT * FROM oauth_clients WHERE client_id=?",
+                              (cid,)).fetchone()
+    if not client:
+        return "Unknown client_id", 400
+    if redirect_uri not in json.loads(client["redirect_uris"]):
+        return "redirect_uri does not match registration", 400
+
+    # Approval = proving you know the dashboard password.
+    if request.method == "POST":
+        if not secrets.compare_digest(request.form.get("password", ""), PASSWORD):
+            return render_template_string(
+                OAUTH_TMPL, error="Wrong password.", args=args), 401
+        session["authed"] = True
+    elif not session.get("authed"):
+        return render_template_string(OAUTH_TMPL, error="", args=args)
+
+    code = secrets.token_urlsafe(32)
+    with _db_lock, db() as conn:
+        conn.execute("INSERT INTO oauth_codes (code,client_id,redirect_uri,"
+                     "code_challenge,expires_at) VALUES (?,?,?,?,?)",
+                     (code, cid, redirect_uri, challenge, time.time() + 600))
+    sep = "&" if "?" in redirect_uri else "?"
+    url = f"{redirect_uri}{sep}code={code}"
+    if state:
+        url += f"&state={state}"
+    return redirect(url)
+
+
+@app.route("/oauth/token", methods=["POST"])
+def oauth_token():
+    if not _oauth_enabled():
+        abort(404)
+    f = request.form or {}
+    code = f.get("code", "")
+    verifier = f.get("code_verifier", "")
+
+    with db() as conn:
+        row = conn.execute("SELECT * FROM oauth_codes WHERE code=?", (code,)).fetchone()
+    if not row:
+        return jsonify({"error": "invalid_grant"}), 400
+    with _db_lock, db() as conn:
+        conn.execute("DELETE FROM oauth_codes WHERE code=?", (code,))
+    if row["expires_at"] < time.time():
+        return jsonify({"error": "invalid_grant", "error_description": "expired"}), 400
+
+    # PKCE
+    if row["code_challenge"]:
+        method = f.get("code_challenge_method") or "S256"
+        if method == "S256":
+            digest = hashlib.sha256(verifier.encode()).digest()
+            computed = base64.urlsafe_b64encode(digest).decode().rstrip("=")
+        else:
+            computed = verifier
+        if not secrets.compare_digest(computed, row["code_challenge"]):
+            return jsonify({"error": "invalid_grant",
+                            "error_description": "PKCE verification failed"}), 400
+
+    token = secrets.token_urlsafe(32)
+    with _db_lock, db() as conn:
+        conn.execute("INSERT INTO oauth_tokens (token,client_id,created_at) "
+                     "VALUES (?,?,?)",
+                     (token, row["client_id"],
+                      datetime.now().strftime("%Y-%m-%d %H:%M")))
+    return jsonify({"access_token": token, "token_type": "Bearer",
+                    "scope": "mcp"})
+
+
+def _bearer_ok():
+    """True if the request carries a valid OAuth access token."""
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    tok = auth[7:].strip()
+    # the static MCP_TOKEN also works as a bearer, for Claude Code / curl
+    if secrets.compare_digest(tok, MCP_TOKEN):
+        return True
+    with db() as conn:
+        return bool(conn.execute("SELECT 1 FROM oauth_tokens WHERE token=?",
+                                 (tok,)).fetchone())
 
 
 # ----------------------------------------------------------------------------
@@ -1111,6 +1332,27 @@ LOGIN_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <label>Password</label>
     <input type="password" name="password" autofocus>
     <div style="margin-top:14px"><button type="submit">Sign in</button></div>
+  </form>
+</div></div></body></html>"""
+
+OAUTH_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize Claude</title><style>""" + BASE_CSS + """
+  .box { max-width:380px; margin:11vh auto; }
+  .sub { color:#64748b; font-size:13px; margin:0 0 16px; }
+</style></head><body>
+<div class="box"><div class="card">
+  <h2 style="margin:0 0 6px">Authorize Claude</h2>
+  <p class="sub">Claude is asking to connect to your AI Visibility Audit
+     dashboard. Enter your dashboard password to allow it.</p>
+  {% if error %}<p class="err">{{ error }}</p>{% endif %}
+  <form method="post">
+    {% for k in ['client_id','redirect_uri','state','code_challenge','code_challenge_method','response_type','scope'] %}
+      <input type="hidden" name="{{ k }}" value="{{ args.get(k, '') }}">
+    {% endfor %}
+    <label>Password</label>
+    <input type="password" name="password" autofocus>
+    <div style="margin-top:14px"><button type="submit">Allow access</button></div>
   </form>
 </div></div></body></html>"""
 
