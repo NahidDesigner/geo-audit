@@ -438,6 +438,59 @@ def pdf(audit_id, variant="internal"):
                      download_name=f"ai-visibility-audit-{site}{tag}.pdf")
 
 
+@app.route("/download-zip")
+@login_required
+def download_zip():
+    """ZIP of Internal + Client PDFs for every completed audit in the current
+    view (respects the ?client= filter). The remediation guide is deliberately
+    excluded - it's the paid deliverable, not something to bulk-send.
+
+    Files are named by domain so the ZIP is human-readable:
+      <domain>-INTERNAL.pdf  (working copy with fixes)
+      <domain>.pdf           (client-safe, findings only)
+    """
+    import io
+    import zipfile
+
+    cid = _current_client()
+    where, params = _client_filter(cid)
+    base = f"SELECT id, url FROM audits{where}"
+    glue = " AND " if where else " WHERE "
+    with db() as conn:
+        rows = conn.execute(
+            base + glue + "status='done' AND pdf=1 ORDER BY id", params
+        ).fetchall()
+    if not rows:
+        abort(404)
+
+    buf = io.BytesIO()
+    added, seen = 0, {}
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for r in rows:
+            domain = (urlparse(r["url"]).netloc or f"audit-{r['id']}")
+            domain = domain.removeprefix("www.").replace(":", "_")
+            # same domain audited twice in one client -> suffix with audit id
+            if domain in seen:
+                domain = f"{domain}-{r['id']}"
+            seen[domain] = True
+            for variant, name in (("internal", f"{domain}-INTERNAL.pdf"),
+                                  ("client", f"{domain}.pdf")):
+                p = _report_path(r["id"], "pdf", variant)
+                if p:
+                    z.write(p, name)
+                    added += 1
+    if not added:
+        abort(404)
+    buf.seek(0)
+
+    c = get_client(cid) if cid else None
+    label = c["name"].lower().replace(" ", "-") if c else (
+        "unassigned" if cid == 0 else "all")
+    stamp = datetime.now().strftime("%Y-%m-%d")
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"ai-visibility-reports-{label}-{stamp}.zip")
+
+
 @app.route("/delete/<int:audit_id>", methods=["POST"])
 @login_required
 def delete(audit_id):
@@ -1277,6 +1330,9 @@ BASE_CSS = """
   .cbtn.on { background:#0f172a; color:#fff; border-color:#0f172a; }
   .cbtn .n { opacity:.6; font-weight:400; margin-left:4px; }
   .cbtn.manage { color:#1d4ed8; border-style:dashed; }
+  .cbtn.dlall { margin-left:auto; color:#15803d; background:#f0fdf4;
+                border-color:#bbf7d0; font-weight:700; }
+  .cbtn.dlall:hover { background:#dcfce7; border-color:#86efac; }
   .ctx { background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px;
          padding:9px 14px; margin-bottom:14px; font-size:13px; color:#1e3a8a; }
   select { width:100%; padding:10px 12px; border:1px solid #cbd5e1;
@@ -1381,6 +1437,9 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
       <a class="cbtn {{ 'on' if cid == c['id'] }}" href="{{ url_for('index', client=c['id']) }}">{{ c['name'] }}<span class="n">{{ c['audit_count'] }}</span></a>
     {% endfor %}
     <a class="cbtn manage" href="{{ url_for('clients_page') }}">+ Manage clients</a>
+    <a class="cbtn dlall" href="{{ url_for('download_zip', client=cid if cid is not none else None) }}"
+       title="ZIP of Internal + Client PDFs for every completed audit in this view (guide not included)">
+       &#8681; Download all (ZIP)</a>
   </div>
   {% if sel_client %}
     <div class="ctx"><b>{{ sel_client['name'] }}</b>
