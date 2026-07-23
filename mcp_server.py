@@ -39,6 +39,11 @@ TOOLS = [
                            "description": "Client/workspace name to file this audit "
                                           "under, e.g. 'Bosseo'. Must already exist "
                                           "(see list_clients). Omit for unassigned."},
+                "deep": {"type": "boolean", "default": False,
+                         "description": "Deep scan: adds an LLM judge's verdict on "
+                                        "citation potential and customer-question "
+                                        "coverage. One LLM API call, ~10s slower. "
+                                        "Requires LLM_PROVIDER configured."},
             },
             "required": ["url"],
         },

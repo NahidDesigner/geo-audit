@@ -637,6 +637,60 @@ GUIDES = {
              "citation surface that a website alone cannot."),
 ],
 
+"Original content across pages": [
+    ("p", "A large share of the text on this site repeats across pages - the pattern "
+          "of programmatic or template-generated content. AI engines actively "
+          "deprioritise duplicated content: when ten pages say the same thing with a "
+          "different city name, none of them earns a citation."),
+    ("ol", [
+        "Identify the template: compare two location or service pages side by side "
+        "and mark every paragraph that is identical or identical-but-for-the-place-name.",
+        "For the pages that matter most (highest-traffic locations or services), "
+        "replace templated sections with content that could only be true of that "
+        "page: local landmarks and courts, area-specific pricing, distinct FAQs, "
+        "different case examples, local regulations.",
+        "Vary the structure too - identical heading sets across pages are a template "
+        "signal even when the prose differs.",
+        "If a location page has nothing unique to say, consolidate it into a parent "
+        "page instead of publishing a thin duplicate.",
+    ]),
+    ("note", "This matters double for programmatic SEO strategies. The pages may still "
+             "rank on classic Google long-tail, but AI engines consolidate answers "
+             "rather than listing many similar pages - only genuinely distinct pages "
+             "get cited."),
+],
+
+"AI citation potential (LLM judge)": [
+    ("p", "An AI model was asked directly: would you cite this page for the query it "
+          "targets? The score and reasoning in the finding are the model's own words - "
+          "this is the closest available proxy for how answer engines weigh the page."),
+    ("ol", [
+        "Read the model's reason in the finding - it names what was missing "
+        "(usually: no direct answer, no concrete figures, or nothing quotable).",
+        "Put a 2-3 sentence direct answer to the target query in the first "
+        "paragraph of the page.",
+        "Add at least two concrete, verifiable figures near the top.",
+        "Re-run a deep scan after the changes and compare the judgment.",
+    ]),
+    ("note", "This check is a judgment call by a model, so the score can vary slightly "
+             "between runs. Treat the reasoning as directional guidance, not a fixed "
+             "measurement - the deterministic checks are the stable baseline."),
+],
+
+"Customer-question coverage (LLM judge)": [
+    ("p", "People ask AI assistants practical questions: what does this business do, "
+          "where, what does it cost, how long does it take, is it right for me. The "
+          "finding lists which of these the homepage currently answers."),
+    ("ol", [
+        "For each missing item in the finding, add a short, direct answer to the "
+        "homepage or link prominently to a page that answers it.",
+        "Cost is the most-asked and most-avoided: even a range ('typically $X-$Y') "
+        "beats silence and beats a competitor who says nothing.",
+        "Phrase each as a question heading with the answer in the first sentence "
+        "below it, then mirror them into FAQPage schema (see that section).",
+    ]),
+],
+
 }
 
 

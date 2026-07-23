@@ -196,6 +196,15 @@ IMPACT = {
         "AI corroborates businesses across multiple platforms."),
     "llms.txt present": ("low",
         "An emerging standard that hands AI a curated map of key pages."),
+    "Original content across pages": ("high",
+        "AI engines deprioritise duplicated template content. Pages that are "
+        "near-copies of each other suppress the whole site's citation odds."),
+    "AI citation potential (LLM judge)": ("high",
+        "A direct judgment from an AI model on whether it would cite this "
+        "page for its target query."),
+    "Customer-question coverage (LLM judge)": ("medium",
+        "AI assistants answer customer questions. Pages that don't cover the "
+        "basics give the engine nothing to work with."),
     "robots.txt reachable": ("high",
         "Without robots.txt you lose control over crawler access and the sitemap hint."),
 }
@@ -762,6 +771,7 @@ def build_html(site, brand, checks, data, internal=True, guide=False):
         "Structured Data": "Can they understand what this business is?",
         "Content Citability": "Is the content worth quoting in an answer?",
         "Entity & Trust": "Do they trust this as a real, credible business?",
+        "AI Judgment": "What does an AI engine itself say about this page?",
     }
 
     strip = ""
@@ -1170,7 +1180,90 @@ def build_html(site, brand, checks, data, internal=True, guide=False):
 # Main
 # ----------------------------------------------------------------------------
 
-def run_audit(url, brand, max_pages, out_base):
+def check_originality(soups, checks, data):
+    """Deterministic template/duplication analysis across the sampled pages.
+    Directly targets programmatic-SEO patterns: AI engines deprioritise
+    duplicated template content, so high duplication suppresses citations."""
+    import deep_scan as DS
+    m = DS.originality_metrics(soups)
+    if m is None:
+        return  # <3 substantial pages - not enough signal, don't guess
+    data["originality"] = m
+    ratio = m["template_ratio"]
+    pct = round(ratio * 100)
+    swap = m["cityswap_pairs"]
+
+    detail_bits = [f"{pct}% of page text is repeated across the "
+                   f"{m['pages_used']} pages sampled"]
+    if swap:
+        detail_bits.append(f"{swap} page pair{'s' if swap != 1 else ''} are "
+                           "near-identical once place names are masked - the "
+                           "classic location-swap template pattern")
+    detail = "; ".join(detail_bits) + "."
+
+    make_check(
+        checks, "Content Citability", "Original content across pages",
+        ok=(ratio < 0.45 and swap == 0), max_points=8,
+        detail_pass=f"Pages are substantially distinct ({pct}% shared text "
+                    f"across {m['pages_used']} pages sampled).",
+        detail_fail=detail,
+        fix="Rewrite key pages so each contains genuinely unique content: "
+            "local specifics, distinct FAQs, different examples and figures. "
+            "Template pages with a swapped city name are treated as "
+            "duplicates by AI engines.",
+        warn=(ratio < 0.70 and swap <= 1))
+
+
+def check_ai_judgment(base, soups, checks, data, llm_cfg):
+    """Opt-in LLM-as-judge: one call asking an AI engine's perspective on the
+    homepage. Non-deterministic - layered on top of the deterministic core."""
+    import deep_scan as DS
+    home = soups[0]
+    text = DS._page_text(home)
+    try:
+        j = DS.llm_judge(llm_cfg, base, text)
+    except Exception as e:
+        checks.append(Check(
+            "AI Judgment", "AI citation potential (LLM judge)", "warn",
+            0, 10, f"Deep scan could not run: {str(e)[:200]}",
+            "Check the LLM provider configuration and re-run the deep scan.",
+            "medium", IMPACT.get("AI citation potential (LLM judge)", ("", ""))[1]))
+        return
+    data["ai_judgment"] = j
+
+    score = j["citation_score"]
+    q = j["target_query"] or "(could not infer)"
+    make_check(
+        checks, "AI Judgment", "AI citation potential (LLM judge)",
+        ok=(score >= 8), max_points=10,
+        detail_pass=f'Judged {score}/10 for the query "{q}". '
+                    f'{j["citation_reason"]}',
+        detail_fail=f'Judged {score}/10 for the query "{q}". '
+                    f'{j["citation_reason"]}',
+        fix="Make the page directly quotable for its target query: a direct "
+            "answer in the first paragraph, concrete figures, and clear "
+            "structure. The deterministic priorities above are what move "
+            "this judgment.",
+        warn=(4 <= score < 8))
+    # proportional points rather than all-or-half
+    checks[-1].points = score
+
+    covered, missing = j["covered"], j["missing"]
+    make_check(
+        checks, "AI Judgment", "Customer-question coverage (LLM judge)",
+        ok=(len(covered) >= 5), max_points=6,
+        detail_pass="The homepage answers " +
+                    ", ".join(DS.label(k) for k in covered) + ".",
+        detail_fail=("Answered: " +
+                     (", ".join(DS.label(k) for k in covered) or "none") +
+                     ". Missing: " + ", ".join(DS.label(k) for k in missing) + "."),
+        fix="Add short, direct answers for the missing questions - these are "
+            "what users actually ask AI assistants.",
+        warn=(3 <= len(covered) < 5))
+    checks[-1].points = len(covered)
+
+
+def run_audit(url, brand, max_pages, out_base, deep_llm=None):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     parsed = urlparse(url)
@@ -1201,6 +1294,9 @@ def run_audit(url, brand, max_pages, out_base):
     check_structured_data(soups, checks, data)
     check_content(soups, [base] + pages, checks, data)
     check_entity(base, soups, session, checks, data)
+    check_originality(soups, checks, data)
+    if deep_llm:
+        check_ai_judgment(base, soups, checks, data, deep_llm)
 
     data.pop("_home_resp", None)
     total = sum(c.points for c in checks)

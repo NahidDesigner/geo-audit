@@ -324,10 +324,18 @@ def audit_assign(audit_id):
 # Audit runner (background thread)
 # ----------------------------------------------------------------------------
 
-def run_audit_job(audit_id, url, brand, max_pages):
+def _deep_llm_cfg():
+    """LLM config for deep scans, or None when not configured."""
+    if not LLM_OK:
+        return None
+    return {"provider": LLM_PROVIDER, "api_key": LLM_KEY, "model": LLM_MODEL}
+
+
+def run_audit_job(audit_id, url, brand, max_pages, deep=False):
     out_base = os.path.join(REPORT_DIR, str(audit_id))
     try:
-        result = run_audit(url, brand, max_pages, out_base)
+        result = run_audit(url, brand, max_pages, out_base,
+                           deep_llm=_deep_llm_cfg() if deep else None)
         with _db_lock, db() as conn:
             conn.execute(
                 "UPDATE audits SET status='done', score=?, grade=?, pdf=? WHERE id=?",
@@ -362,7 +370,7 @@ def index():
     return render_template_string(
         INDEX_TMPL, rows=rows, running=running,
         default_brand=client_brand(cid) if cid else DEFAULT_BRAND,
-        clients=all_clients(), cid=cid, counts=counts,
+        clients=all_clients(), cid=cid, counts=counts, llm_ok=LLM_OK,
         sel_client=get_client(cid) if cid else None)
 
 
@@ -397,7 +405,9 @@ def run():
             (url, brand, max_pages, "running",
              datetime.now().strftime("%Y-%m-%d %H:%M"), cid))
         audit_id = cur.lastrowid
-    threading.Thread(target=run_audit_job, args=(audit_id, url, brand, max_pages),
+    deep = request.form.get("deep") == "1"
+    threading.Thread(target=run_audit_job,
+                     args=(audit_id, url, brand, max_pages, deep),
                      daemon=True).start()
     return redirect(url_for("index", client=raw_cid or None))
 
@@ -784,8 +794,10 @@ def _mcp_call(name, args):
             aid = cur.lastrowid
         # run synchronously: the chat is waiting for the answer
         try:
+            deep = bool(args.get("deep"))
             res = run_audit(url, brand, max_pages,
-                            os.path.join(REPORT_DIR, str(aid)))
+                            os.path.join(REPORT_DIR, str(aid)),
+                            deep_llm=_deep_llm_cfg() if deep else None)
         except Exception as e:
             with _db_lock, db() as conn:
                 conn.execute("UPDATE audits SET status='error', error=? WHERE id=?",
@@ -1476,6 +1488,14 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
           <label>Pages</label>
           <input type="number" name="max_pages" value="8" min="2" max="25">
         </div>
+      </div>
+      <div style="margin-top:12px;display:flex;align-items:center;gap:8px">
+        <input type="checkbox" name="deep" value="1" id="deep"
+               {{ 'disabled' if not llm_ok }}>
+        <label for="deep" style="display:inline;font-weight:400;font-size:13px;color:#475569">
+          Deep scan &mdash; adds an AI judge's verdict on citation potential
+          (one LLM call, ~10s slower{{ ', requires LLM configuration' if not llm_ok }})
+        </label>
       </div>
       <div style="margin-top:14px"><button type="submit">Run Audit</button></div>
     </form>
