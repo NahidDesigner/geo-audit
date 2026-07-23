@@ -694,9 +694,9 @@ def re_render_reports(audit_id):
             f.write(build_html(site, row["brand"], checks, raw["data"],
                                manual=manual, **kw))
     try:
-        from weasyprint import HTML
+        import pdf_render
         for path, _ in variants:
-            HTML(filename=path).write_pdf(path.replace(".html", ".pdf"))
+            pdf_render.html_to_pdf(path, path.replace(".html", ".pdf"))
     except Exception:
         traceback.print_exc()
     return True

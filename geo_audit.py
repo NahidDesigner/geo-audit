@@ -1042,8 +1042,10 @@ def build_html(site, brand, checks, data, internal=True, guide=False,
   body {{ font-family:'Segoe UI',Helvetica,Arial,sans-serif; color:#1e293b; margin:0;
          font-size:11px; line-height:1.55; }}
 
-  /* Screen: a centred, boxed sheet on a soft background.
-     Print/PDF: the wrapper collapses so @page margins govern instead. */
+  /* The PDF is rendered by headless Chromium from this same HTML, so print
+     keeps the on-screen layout rather than collapsing to a bare page. Only the
+     grey desk background and drop shadow are dropped - they waste ink and add
+     nothing on paper. */
   .page {{ max-width:860px; margin:0 auto; padding:34px 38px 44px;
            background:#fff; }}
   @media screen {{
@@ -1053,8 +1055,9 @@ def build_html(site, brand, checks, data, internal=True, guide=False,
   }}
   @media print {{
     body {{ background:#fff; padding:0; }}
-    .page {{ max-width:none; margin:0; padding:0; box-shadow:none;
-             border-radius:0; }}
+    .page {{ box-shadow:none; border-radius:0; padding:0; }}
+    /* force background colours/gradients through in print */
+    * {{ -webkit-print-color-adjust:exact; print-color-adjust:exact; }}
   }}
   h1,h2,h3 {{ margin:0; }}
 
@@ -1529,14 +1532,19 @@ def run_audit(url, brand, max_pages, out_base, deep_llm=None, manual=None):
 
     pdf_ok = False
     try:
-        from weasyprint import HTML
-        HTML(string=html).write_pdf(f"{out_base}.pdf")
-        HTML(string=client_html).write_pdf(f"{out_base}-client.pdf")
-        HTML(string=guide_html).write_pdf(f"{out_base}-guide.pdf")
-        print(f"  wrote {out_base}.pdf + -client.pdf + -guide.pdf")
-        pdf_ok = True
+        import pdf_render
+        engines = set()
+        for suffix in ("", "-client", "-guide"):
+            eng = pdf_render.html_to_pdf(f"{out_base}{suffix}.html",
+                                         f"{out_base}{suffix}.pdf")
+            if eng:
+                engines.add(eng)
+        if engines:
+            print(f"  wrote {out_base}.pdf + -client.pdf + -guide.pdf "
+                  f"({'/'.join(sorted(engines))})")
+            pdf_ok = True
     except ImportError:
-        print("  (weasyprint not installed - skipped PDF; HTML reports are complete)")
+        print("  (no PDF engine available - HTML reports are complete)")
     except Exception as e:
         print(f"  (PDF generation failed: {e}; HTML report is complete)")
 
