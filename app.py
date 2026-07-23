@@ -122,6 +122,17 @@ def init_db():
         # same business, so a global unique index would be wrong.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prospect_client_domain "
                      "ON prospects(client_id, domain)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS presence_tests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            client_id INTEGER,
+            engine TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            result INTEGER NOT NULL,      -- 3 recommended / 2 mentioned / 1 sources-only / 0 absent
+            notes TEXT,
+            tested_at TEXT NOT NULL
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ptest_client "
+                     "ON presence_tests(client_id, engine, prompt)")
 
 
 init_db()
@@ -509,6 +520,128 @@ def delete(audit_id):
     with _db_lock, db() as conn:
         conn.execute("DELETE FROM audits WHERE id=?", (audit_id,))
     return redirect(url_for("index"))
+
+
+# ---------------------------------------------------------------------------
+# AI Tests - manual presence testing across AI engines
+#
+# Automated testing of consumer AI surfaces (ChatGPT, Gemini, AI Overviews)
+# is not feasible: there is no API for those experiences and simulating them
+# would be dishonest. Instead: you run standard prompts in the real engines,
+# record what happened, and the app scores it. Human-run, machine-scored.
+# ---------------------------------------------------------------------------
+
+ENGINES = {
+    "chatgpt": "ChatGPT",
+    "gemini": "Gemini",
+    "perplexity": "Perplexity",
+    "claude": "Claude",
+    "ai_overviews": "Google AI Overviews",
+    "ai_mode": "Google AI Mode",
+    "copilot": "Bing Copilot",
+}
+
+RESULT_LABELS = {
+    3: "Recommended by name",
+    2: "Mentioned / cited among others",
+    1: "In sources only / after follow-up",
+    0: "Not present",
+}
+
+
+def promptpack(service, city, business):
+    """The standard test prompts for a local business. Same pack every time,
+    so scores are comparable between businesses and across months."""
+    s, c, b = service.strip(), city.strip(), business.strip()
+    out = [
+        f"best {s} in {c}",
+        f"who is the best {s} in {c}? give me 2-3 names",
+        f"I need a {s} in {c} - who should I contact?",
+        f"how much does a {s} cost in {c}?",
+        f"compare the top {s} options in {c}",
+        f"what should I look for when hiring a {s} in {c}?",
+    ]
+    if b:
+        out += [f"is {b} in {c} legit? what do reviews say?",
+                f"tell me about {b} in {c}"]
+    return out
+
+
+def presence_scores(cid):
+    """Score from the LATEST entry per (engine, prompt) in this client scope.
+    Re-testing a prompt supersedes the old result; history rows are kept."""
+    where, params = _client_filter(cid)
+    with db() as conn:
+        rows = conn.execute(
+            f"""SELECT p.* FROM presence_tests p
+                JOIN (SELECT engine, prompt, MAX(id) mid FROM presence_tests
+                      {where} GROUP BY engine, prompt) latest
+                ON p.id = latest.mid
+                ORDER BY p.engine, p.id""", params).fetchall()
+    if not rows:
+        return None
+    overall_e = sum(r["result"] for r in rows)
+    overall_m = 3 * len(rows)
+    per_engine = {}
+    for r in rows:
+        e = per_engine.setdefault(r["engine"], {"earned": 0, "max": 0, "n": 0})
+        e["earned"] += r["result"]
+        e["max"] += 3
+        e["n"] += 1
+    for e in per_engine.values():
+        e["pct"] = round(100 * e["earned"] / e["max"])
+    return {"pct": round(100 * overall_e / overall_m), "tests": len(rows),
+            "per_engine": per_engine, "latest_rows": rows}
+
+
+@app.route("/aitests")
+@login_required
+def aitests_page():
+    cid = _current_client()
+    where, params = _client_filter(cid)
+    with db() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM presence_tests{where} ORDER BY id DESC LIMIT 300",
+            params).fetchall()
+    svc = request.args.get("svc", "")
+    city = request.args.get("city", "")
+    biz = request.args.get("biz", "")
+    pack = promptpack(svc, city, biz) if (svc and city) else []
+    return render_template_string(
+        AITESTS_TMPL, rows=rows, clients=all_clients(), cid=cid,
+        sel_client=get_client(cid) if cid else None,
+        scores=presence_scores(cid), engines=ENGINES, labels=RESULT_LABELS,
+        pack=pack, svc=svc, city=city, biz=biz)
+
+
+@app.route("/aitests/add", methods=["POST"])
+@login_required
+def aitests_add():
+    raw_cid = request.form.get("client_id") or ""
+    cid = int(raw_cid) if raw_cid.isdigit() and int(raw_cid) > 0 else None
+    engine = request.form.get("engine", "")
+    prompt = (request.form.get("prompt") or "").strip()
+    notes = (request.form.get("notes") or "").strip()
+    try:
+        result = int(request.form.get("result", -1))
+    except ValueError:
+        result = -1
+    if engine in ENGINES and prompt and result in RESULT_LABELS:
+        with _db_lock, db() as conn:
+            conn.execute(
+                "INSERT INTO presence_tests (client_id,engine,prompt,result,"
+                "notes,tested_at) VALUES (?,?,?,?,?,?)",
+                (cid, engine, prompt, result, notes or None,
+                 datetime.now().strftime("%Y-%m-%d %H:%M")))
+    return redirect(url_for("aitests_page", client=raw_cid or None))
+
+
+@app.route("/aitests/delete/<int:tid>", methods=["POST"])
+@login_required
+def aitests_delete(tid):
+    with _db_lock, db() as conn:
+        conn.execute("DELETE FROM presence_tests WHERE id=?", (tid,))
+    return redirect(request.referrer or url_for("aitests_page"))
 
 
 # ----------------------------------------------------------------------------
@@ -1046,6 +1179,67 @@ def _mcp_call(name, args):
         return MCP._text(json.dumps(
             {"audit_id": aid, "client": cname or "(unassigned)"}, indent=2))
 
+    if name == "record_ai_test":
+        engine = (args.get("engine") or "").lower()
+        prompt = (args.get("prompt") or "").strip()
+        try:
+            result = int(args.get("result", -1))
+        except (TypeError, ValueError):
+            result = -1
+        if engine not in ENGINES:
+            return MCP._fail(f"engine must be one of {list(ENGINES)}")
+        if not prompt:
+            return MCP._fail("A prompt is required.")
+        if result not in RESULT_LABELS:
+            return MCP._fail("result must be 0-3: 3 recommended by name, "
+                             "2 mentioned/cited, 1 sources only, 0 not present")
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
+        with _db_lock, db() as conn:
+            conn.execute(
+                "INSERT INTO presence_tests (client_id,engine,prompt,result,"
+                "notes,tested_at) VALUES (?,?,?,?,?,?)",
+                (cid, engine, prompt, result,
+                 (args.get("notes") or "").strip() or None,
+                 datetime.now().strftime("%Y-%m-%d %H:%M")))
+        s = presence_scores(cid)
+        return MCP._text(json.dumps({
+            "recorded": {"engine": engine, "prompt": prompt, "result": result,
+                         "meaning": RESULT_LABELS[result]},
+            "presence_score_now": f"{s['pct']}% across {s['tests']} tests" if s else None,
+        }, indent=2))
+
+    if name == "list_ai_tests":
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
+        where, params = _client_filter(cid if args.get("client") else None)
+        with db() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM presence_tests{where} ORDER BY id DESC LIMIT 100",
+                params).fetchall()
+        return MCP._text(json.dumps([{
+            "id": r["id"], "engine": r["engine"], "prompt": r["prompt"],
+            "result": r["result"], "meaning": RESULT_LABELS[r["result"]],
+            "notes": r["notes"], "tested_at": r["tested_at"],
+        } for r in rows], indent=2))
+
+    if name == "ai_presence_score":
+        cid, err = _client_id_by_name(args.get("client"))
+        if err:
+            return MCP._fail(err)
+        s = presence_scores(cid if args.get("client") else None)
+        if not s:
+            return MCP._fail("No tests recorded yet for that scope.")
+        return MCP._text(json.dumps({
+            "presence_score_pct": s["pct"], "active_tests": s["tests"],
+            "per_engine": {ENGINES.get(k, k): f"{v['pct']}% ({v['n']} tests)"
+                           for k, v in s["per_engine"].items()},
+            "note": "Score uses the latest entry per (engine, prompt); older "
+                    "entries remain as history.",
+        }, indent=2))
+
     return MCP._fail(f"Unknown tool: {name}")
 
 
@@ -1435,6 +1629,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <nav class="tabs">
       <a class="on" href="{{ url_for('index') }}">Audits</a>
       <a href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a href="{{ url_for('aitests_page') }}">AI Tests</a>
       <a href="{{ url_for('clients_page') }}">Clients</a>
     </nav>
   </div>
@@ -1598,6 +1793,7 @@ PROSPECTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <nav class="tabs">
       <a href="{{ url_for('index') }}">Audits</a>
       <a class="on" href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a href="{{ url_for('aitests_page') }}">AI Tests</a>
       <a href="{{ url_for('clients_page') }}">Clients</a>
     </nav>
   </div>
@@ -1780,6 +1976,7 @@ CLIENTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
     <nav class="tabs">
       <a href="{{ url_for('index') }}">Audits</a>
       <a href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a href="{{ url_for('aitests_page') }}">AI Tests</a>
       <a class="on" href="{{ url_for('clients_page') }}">Clients</a>
     </nav>
   </div>
@@ -1851,6 +2048,252 @@ CLIENTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         under it and kept separate from everything else.
       </div>
     {% endif %}
+  </div>
+</div></body></html>"""
+
+
+AITESTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Tests - GEO Audit</title>
+<style>""" + BASE_CSS + """
+  .scorecard { display:flex; gap:20px; align-items:center; flex-wrap:wrap; }
+  .bignum { font-size:44px; font-weight:800; }
+  .ebar { display:flex; align-items:center; gap:8px; margin-bottom:6px; }
+  .ebar .en { flex:0 0 150px; font-size:12px; font-weight:600; color:#475569; }
+  .ebar .tr { flex:1; height:7px; background:#f1f5f9; border-radius:4px; overflow:hidden; }
+  .ebar .tr div { height:100%; border-radius:4px; }
+  .ebar .pv { flex:0 0 68px; font-size:12px; font-weight:700; text-align:right; }
+  .res { font-size:10.5px; font-weight:800; letter-spacing:.4px; padding:2px 9px;
+         border-radius:20px; white-space:nowrap; }
+  .r3 { background:#f0fdf4; color:#15803d; } .r2 { background:#eff6ff; color:#1d4ed8; }
+  .r1 { background:#fffbeb; color:#b45309; } .r0 { background:#fef2f2; color:#b91c1c; }
+  .pk { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px;
+        padding:9px 12px; margin-bottom:7px; display:flex; gap:10px;
+        align-items:center; justify-content:space-between; }
+  .pk code { font-size:12.5px; color:#0f172a; }
+  details { border:1px solid #e2e8f0; border-radius:9px; padding:12px 16px;
+            margin-bottom:9px; }
+  details summary { cursor:pointer; font-weight:700; color:#0f172a; font-size:13.5px; }
+  details ol { margin:10px 0 4px; padding-left:20px; color:#334155; font-size:13px; }
+  details li { margin-bottom:6px; }
+  details .warn { background:#fffbeb; border:1px solid #fde68a; border-radius:7px;
+                  padding:8px 12px; color:#92400e; font-size:12.5px; margin-top:8px; }
+  .rubric td { font-size:12.5px; }
+</style></head><body>
+<div class="topbar"><div class="wrap">
+  <div style="display:flex;align-items:center;gap:22px">
+    <h1>AI Visibility Audit</h1>
+    <nav class="tabs">
+      <a href="{{ url_for('index') }}">Audits</a>
+      <a href="{{ url_for('prospects_page') }}">Prospecting</a>
+      <a class="on" href="{{ url_for('aitests_page') }}">AI Tests</a>
+      <a href="{{ url_for('clients_page') }}">Clients</a>
+    </nav>
+  </div>
+  <a href="{{ url_for('logout') }}">Log out</a>
+</div></div>
+<div class="wrap">
+
+  <div class="clientbar">
+    <a class="cbtn {{ 'on' if cid is none }}" href="{{ url_for('aitests_page') }}">All</a>
+    <a class="cbtn {{ 'on' if cid == 0 }}" href="{{ url_for('aitests_page', client=0) }}">Unassigned</a>
+    {% for c in clients %}
+      <a class="cbtn {{ 'on' if cid == c['id'] }}" href="{{ url_for('aitests_page', client=c['id']) }}">{{ c['name'] }}</a>
+    {% endfor %}
+    <a class="cbtn manage" href="{{ url_for('clients_page') }}">+ Manage clients</a>
+  </div>
+  {% if sel_client %}
+    <div class="ctx">Recording AI presence tests for <b>{{ sel_client['name'] }}</b>.
+      Re-testing the same prompt later replaces its result in the score; old
+      entries are kept as history.</div>
+  {% endif %}
+
+  {% if scores %}
+  <div class="card">
+    <div class="scorecard">
+      <div style="text-align:center">
+        {% set pc = scores['pct'] %}
+        <div class="bignum" style="color:{{ '#16a34a' if pc>=70 else '#d97706' if pc>=40 else '#dc2626' }}">{{ pc }}%</div>
+        <div style="font-size:11px;color:#94a3b8;letter-spacing:.6px">AI PRESENCE SCORE<br>{{ scores['tests'] }} active tests</div>
+      </div>
+      <div style="flex:1;min-width:260px">
+        {% for ek, ev in scores['per_engine'].items() %}
+        <div class="ebar">
+          <div class="en">{{ engines.get(ek, ek) }}</div>
+          <div class="tr"><div style="width:{{ ev['pct'] }}%;background:{{ '#16a34a' if ev['pct']>=70 else '#d97706' if ev['pct']>=40 else '#dc2626' }}"></div></div>
+          <div class="pv">{{ ev['pct'] }}% <span style="color:#94a3b8;font-weight:400">({{ ev['n'] }})</span></div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <h3 style="margin:0 0 4px">1 &middot; Generate the standard prompt pack</h3>
+    <p style="color:#64748b;font-size:13px;margin:0 0 12px">Always test the same
+      prompts, phrased the same way - that's what makes this month's score
+      comparable to next month's.</p>
+    <form method="get">
+      {% if cid is not none %}<input type="hidden" name="client" value="{{ cid }}">{% endif %}
+      <div class="row">
+        <div><label>Service type</label><input type="text" name="svc" value="{{ svc }}" placeholder="personal injury lawyer"></div>
+        <div><label>City</label><input type="text" name="city" value="{{ city }}" placeholder="Denver, CO"></div>
+        <div><label>Business name <span style="font-weight:400;color:#94a3b8">(optional)</span></label>
+             <input type="text" name="biz" value="{{ biz }}" placeholder="Smith Legal"></div>
+      </div>
+      <div style="margin-top:12px"><button type="submit">Generate prompts</button></div>
+    </form>
+    {% if pack %}
+      <div style="margin-top:14px">
+      {% for p in pack %}<div class="pk"><code>{{ p }}</code></div>{% endfor %}
+      </div>
+      <p style="color:#64748b;font-size:12.5px;margin:8px 0 0">Copy each prompt into
+        each engine (guides below), then record what happened in step 2.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 12px">2 &middot; Record a result</h3>
+    <form method="post" action="{{ url_for('aitests_add') }}">
+      <input type="hidden" name="client_id" value="{{ cid if cid else '' }}">
+      <div class="row">
+        <div style="flex:0 0 190px">
+          <label>Engine</label>
+          <select name="engine">{% for k, v in engines.items() %}<option value="{{ k }}">{{ v }}</option>{% endfor %}</select>
+        </div>
+        <div style="flex:3"><label>Prompt (exactly as asked)</label>
+          <input type="text" name="prompt" required placeholder="best personal injury lawyer in Denver"></div>
+        <div style="flex:0 0 250px">
+          <label>Result</label>
+          <select name="result">{% for k, v in labels.items() %}<option value="{{ k }}">{{ k }} - {{ v }}</option>{% endfor %}</select>
+        </div>
+      </div>
+      <div style="margin-top:10px"><label>Notes <span style="font-weight:400;color:#94a3b8">(who WAS recommended, position, wording)</span></label>
+        <input type="text" name="notes" placeholder="Recommended Jones Law and Miller & Co; client absent"></div>
+      <div style="margin-top:12px"><button type="submit">Save result</button></div>
+    </form>
+
+    <table style="margin-top:16px">
+      <tr><th>Date</th><th>Engine</th><th>Prompt</th><th>Result</th><th>Notes</th><th></th></tr>
+      {% for r in rows %}
+      <tr>
+        <td style="white-space:nowrap;color:#94a3b8;font-size:12px">{{ r['tested_at'] }}</td>
+        <td style="font-weight:600;font-size:12.5px">{{ engines.get(r['engine'], r['engine']) }}</td>
+        <td style="font-size:12.5px">{{ r['prompt'] }}</td>
+        <td><span class="res r{{ r['result'] }}">{{ r['result'] }} &middot; {{ labels[r['result']] }}</span></td>
+        <td style="color:#64748b;font-size:12px">{{ r['notes'] or '' }}</td>
+        <td style="text-align:right">
+          <form method="post" action="{{ url_for('aitests_delete', tid=r['id']) }}" style="margin:0">
+            <button class="danger" onclick="return confirm('Delete this entry?')">×</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      {% if not rows %}<tr><td colspan="6" style="color:#94a3b8">No tests recorded yet.
+        Generate a prompt pack above, run the prompts in each engine, and record what happened.</td></tr>{% endif %}
+    </table>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 4px">How to test - step by step per engine</h3>
+    <p style="color:#64748b;font-size:13px;margin:0 0 12px">Consistency is the whole
+      game: fresh session, exact prompt, record immediately. If the method drifts,
+      the score stops meaning anything.</p>
+
+    <details><summary>Scoring rubric - what number to record</summary>
+      <table class="rubric" style="margin-top:10px">
+        <tr><td><span class="res r3">3</span></td><td><b>Recommended by name</b> - the engine names the business as a recommendation or top answer in its own words.</td></tr>
+        <tr><td><span class="res r2">2</span></td><td><b>Mentioned / cited</b> - the business appears in the answer among others, or its site is cited as a source for a claim.</td></tr>
+        <tr><td><span class="res r1">1</span></td><td><b>Sources only</b> - not in the answer text, but the site shows in the sources/links panel, or appears only after you ask a follow-up.</td></tr>
+        <tr><td><span class="res r0">0</span></td><td><b>Not present</b> - absent entirely, or only competitors are named.</td></tr>
+      </table>
+      <div class="warn">Score what the engine actually said, not what you hoped. A
+        generous score today makes next month's improvement invisible.</div>
+    </details>
+
+    <details><summary>ChatGPT</summary>
+      <ol>
+        <li>Log out, or open a Temporary Chat (model picker &rarr; Temporary) so
+            memory and custom instructions don't personalise the answer.</li>
+        <li>Make sure Search is enabled (the globe icon) - visibility testing is
+            about the search-augmented answer, not training data alone.</li>
+        <li>Paste the prompt exactly as written in the pack. No extra context.</li>
+        <li>Read the full answer AND expand the sources. Score with the rubric.</li>
+        <li>Record the result immediately, noting who WAS recommended.</li>
+        <li>New Temporary Chat for the next prompt - never reuse a conversation,
+            earlier answers contaminate later ones.</li>
+      </ol>
+    </details>
+
+    <details><summary>Google AI Overviews &amp; AI Mode</summary>
+      <ol>
+        <li>Open an Incognito window (personalised results otherwise).</li>
+        <li>Location matters here more than any other engine: if testing for a
+            city you're not in, append the city to the query and note it.</li>
+        <li>Search the prompt. If an AI Overview appears, score it. If none
+            appears, note "no AI Overview shown" - that itself is a finding.</li>
+        <li>For AI Mode, switch to the AI Mode tab and ask the same prompt.</li>
+        <li>Record AI Overviews and AI Mode as separate entries - they behave
+            differently.</li>
+      </ol>
+      <div class="warn">You're testing from Bangladesh for US businesses:
+        results are location-influenced, so treat Google scores as directional.
+        Where possible, have the client run the same searches locally and send
+        screenshots - their view is the ground truth.</div>
+    </details>
+
+    <details><summary>Perplexity</summary>
+      <ol>
+        <li>Log out or use a private window.</li>
+        <li>Paste the prompt. Perplexity always searches, so no toggle needed.</li>
+        <li>Check both the answer text and the numbered citations - a citation
+            of the client's site scores 2 even if the name isn't in the prose.</li>
+        <li>Note the citation position (source #1 vs #8) in the notes field.</li>
+      </ol>
+    </details>
+
+    <details><summary>Gemini</summary>
+      <ol>
+        <li>Use a profile with no prior history about the client, or a private
+            window.</li>
+        <li>Paste the prompt exactly. Check any "Sources" or search suggestions
+            it shows alongside the answer.</li>
+        <li>Gemini often hedges with "consult local directories" - if it names
+            no businesses at all, score 0 and note "named nobody" (that's
+            different from naming competitors).</li>
+      </ol>
+    </details>
+
+    <details><summary>Claude</summary>
+      <ol>
+        <li>Open a fresh chat with web search enabled.</li>
+        <li>Paste the prompt exactly; score answer text and cited sources with
+            the same rubric.</li>
+      </ol>
+    </details>
+
+    <details><summary>Bing Copilot</summary>
+      <ol>
+        <li>Private window, copilot.microsoft.com.</li>
+        <li>Paste the prompt; check answer and the link cards beneath it.</li>
+      </ol>
+    </details>
+
+    <details><summary>Method rules (read once, follow always)</summary>
+      <ol>
+        <li><b>Same prompts, same wording, every round.</b> The pack generator
+            exists so the phrasing never drifts.</li>
+        <li><b>Test monthly</b>, same week each month. AI answers move slowly;
+            more frequent testing measures noise.</li>
+        <li><b>One engine, one prompt, one entry.</b> Re-testing later just adds
+            a new entry - the score automatically uses the newest.</li>
+        <li><b>Screenshot everything.</b> The before/after screenshots are your
+            proof of progress when you report to the client.</li>
+        <li><b>Log competitors in notes.</b> Who the engine DID recommend is
+            next month's gap analysis for free.</li>
+      </ol>
+    </details>
   </div>
 </div></body></html>"""
 

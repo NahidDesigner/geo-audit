@@ -165,6 +165,54 @@ TOOLS = [
         },
     },
     {
+        "name": "record_ai_test",
+        "description": (
+            "Record the result of a manual AI presence test: you ran a prompt in a "
+            "real AI engine (ChatGPT, Gemini, Perplexity, etc.) and are logging what "
+            "happened. Result scale: 3 = business recommended by name, 2 = mentioned "
+            "or cited among others, 1 = in sources only / after follow-up, 0 = not "
+            "present. Re-testing the same engine+prompt later supersedes the old "
+            "result in the score; history is kept."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "engine": {"type": "string",
+                           "description": "chatgpt | gemini | perplexity | claude | "
+                                          "ai_overviews | ai_mode | copilot"},
+                "prompt": {"type": "string",
+                           "description": "The prompt exactly as asked in the engine."},
+                "result": {"type": "integer",
+                           "description": "0-3 per the scale above."},
+                "notes": {"type": "string",
+                          "description": "Optional: who WAS recommended, position, wording."},
+                "client": {"type": "string",
+                           "description": "Client workspace to file this under."},
+            },
+            "required": ["engine", "prompt", "result"],
+        },
+    },
+    {
+        "name": "list_ai_tests",
+        "description": "List recorded AI presence tests, newest first.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": {"type": "string", "description": "Filter to one client."},
+            },
+        },
+    },
+    {
+        "name": "ai_presence_score",
+        "description": ("The AI Presence Score: overall % and per-engine breakdown, "
+                        "computed from the latest entry per engine+prompt."),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "client": {"type": "string", "description": "Score one client's tests."},
+            },
+        },
+    },
+    {
         "name": "list_clients",
         "description": ("List client workspaces. Audits and prospects can be filed "
                         "under a client to keep each client's sites separate."),
