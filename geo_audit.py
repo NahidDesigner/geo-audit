@@ -844,6 +844,18 @@ def build_html(site, brand, checks, data, internal=True, guide=False,
       </section>"""
 
     # ---------- full breakdown ----------
+    # Some checks are conditional (HTTPS only over https, local signals only
+    # when schema names a city, originality only with 3+ substantial pages), so
+    # the number that ran varies per site. Say what ran, not "all N".
+    skipped = [n for n in IMPACT if n not in {c.name for c in checks}]
+    # robots.txt reachable / AI crawlers allowed are mutually exclusive - not a
+    # real omission, so don't report either as skipped.
+    skipped = [n for n in skipped
+               if n not in ("robots.txt reachable", "CDN bot-blocking risk")]
+    skip_note = ""
+    if skipped and internal:
+        skip_note = (' <span style="color:#94a3b8">Not applicable to this site: '
+                     + ", ".join(skipped) + ".</span>")
     def detail_rows(items):
         rows = ""
         for c in items:
@@ -1240,7 +1252,8 @@ def build_html(site, brand, checks, data, internal=True, guide=False,
   <section class="block">
     <div class="block-head">
       <h2>Full breakdown</h2>
-      <div class="block-sub">All {len(checks)} checks, grouped by category.</div>
+      <div class="block-sub">{len(checks)} checks ran on this site, grouped by
+        category.{skip_note}</div>
     </div>
     {breakdown}
   </section>
