@@ -196,6 +196,19 @@ IMPACT = {
         "AI corroborates businesses across multiple platforms."),
     "llms.txt present": ("low",
         "An emerging standard that hands AI a curated map of key pages."),
+    "HTTPS enforced": ("medium",
+        "Insecure duplicates of pages get downranked or refused by retrieval "
+        "systems."),
+    "Legal & policy pages": ("low",
+        "Privacy and terms pages are baseline legitimacy signals for a real "
+        "business."),
+    "Social profiles linked": ("medium",
+        "Cross-platform presence is how AI corroborates the business as a "
+        "real entity."),
+    "Local signals (city + map)": ("high",
+        "Local AI answers anchor on an unambiguous city and a verifiable map "
+        "presence. A location page that never names its location loses to one "
+        "that does."),
     "Original content across pages": ("high",
         "AI engines deprioritise duplicated template content. Pages that are "
         "near-copies of each other suppress the whole site's citation odds."),
@@ -715,7 +728,8 @@ def render_steps(steps, domain):
     return out
 
 
-def build_html(site, brand, checks, data, internal=True, guide=False):
+def build_html(site, brand, checks, data, internal=True, guide=False,
+               manual=None):
     """internal=True  -> working copy: includes the short recommended fix per check.
        internal=False -> client copy: findings only, no fixes.
        guide=True     -> remediation guide: findings + short fix + full step-by-step
@@ -897,6 +911,72 @@ def build_html(site, brand, checks, data, internal=True, guide=False):
             or content work has any effect.</div>
         </div>
         {blocks}
+      </section>"""
+
+    # ---------- extended audit (manual off-site verification) ----------
+    extended = ""
+    if manual:
+        import manual_audit as MA
+        e_earn, e_max = MA.extended_score(manual)
+        filled = [m for m in manual if m["status"]]
+        unfilled = [m for m in manual if not m["status"]]
+        sub = (f"Verified by hand: what the wider web says about this business "
+               f"- profiles, reviews, mentions. {len(filled)} of {len(manual)} "
+               f"topics verified"
+               + (f"; extended score {e_earn}/{e_max}." if filled else "."))
+        rows_html = ""
+        for m in manual:
+            lbl_i, col_i, bg_i = IMPACT_META[m["impact"]]
+            if m["status"]:
+                s_lbl, s_col, s_bg = STATUS_META[
+                    {"pass": "pass", "warn": "warn", "fail": "fail"}[m["status"]]]
+                body = (f'<div class="detail"><b>{m["question"]}</b> '
+                        f'{m["notes"] or "(no notes recorded)"}</div>')
+                head_right = f'<span class="pts">{m["points"]}/{m["max_points"]}</span>'
+                badge = (f'<span class="badge" style="color:{s_col};'
+                         f'background:{s_bg};border-color:{s_col}40">{s_lbl}</span>')
+            elif internal:
+                body = ('<div class="detail" style="color:#94a3b8">Not yet '
+                        'verified - record it on the Manual checks page.</div>')
+                head_right = f'<span class="pts">-/{m["max_points"]}</span>'
+                badge = ('<span class="badge" style="color:#64748b;'
+                         'background:#f8fafc;border-color:#cbd5e1">TO VERIFY</span>')
+            elif guide:
+                body = ""
+                head_right = ""
+                badge = ('<span class="badge" style="color:#64748b;'
+                         'background:#f8fafc;border-color:#cbd5e1">CHECKLIST</span>')
+            else:
+                # client copy, unfilled -> locked teaser (the upsell)
+                body = ('<div class="detail" style="color:#94a3b8">&#128274; '
+                        'Verified as part of the full audit engagement.</div>')
+                head_right = ""
+                badge = ('<span class="badge" style="color:#6d28d9;'
+                         'background:#faf5ff;border-color:#6d28d9">FULL AUDIT</span>')
+            steps = (f'<div class="g-steps">{render_steps([("ol", m["how"])], site)}</div>'
+                     if guide else "")
+            why = (f'<div class="prio-why">{m["why"]}</div>' if (guide or internal) else "")
+            rows_html += f"""
+            <div class="check {m['status'] or ''}">
+              <div class="check-head">
+                {badge}
+                <span class="impact" style="color:{col_i};background:{bg_i};border-color:{col_i}40">{lbl_i}</span>
+                <span class="check-name">{m['name']}</span>
+                {head_right}
+              </div>
+              {why}
+              {body}
+              {steps}
+            </div>"""
+        extended = f"""
+      <section class="block">
+        <div class="block-head">
+          <h2>Extended audit &mdash; off-site presence</h2>
+          <div class="block-sub">{sub if (internal or filled) else
+            'AI engines judge a business by its whole web footprint - profiles, reviews, '
+            'directories, mentions - not just the website. These topics are verified by hand.'}</div>
+        </div>
+        {rows_html}
       </section>"""
 
     # ---------- closing ----------
@@ -1165,6 +1245,8 @@ def build_html(site, brand, checks, data, internal=True, guide=False):
     {breakdown}
   </section>
 
+  {extended}
+
   {remediation}
 
   {closing}
@@ -1179,6 +1261,104 @@ def build_html(site, brand, checks, data, internal=True, guide=False):
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+
+def check_site_basics(base, soups, session, checks, data):
+    """Small deterministic checks closing the gaps vs a full pillar model:
+    HTTPS enforcement, legal pages, social links, local signals."""
+    home = soups[0]
+
+    # --- HTTPS enforced (only meaningful when audited over https)
+    if base.startswith("https://"):
+        http_url = "http://" + base[len("https://"):] + "/"
+        try:
+            r = session.get(http_url, timeout=10, allow_redirects=False)
+            redirected = r.status_code in (301, 302, 307, 308) and \
+                (r.headers.get("Location", "").startswith("https://"))
+        except requests.RequestException:
+            redirected = True  # http closed entirely - fine
+        make_check(
+            checks, "AI Crawler Access", "HTTPS enforced",
+            ok=redirected, max_points=3,
+            detail_pass="HTTP requests redirect to HTTPS.",
+            detail_fail="The site answers on plain HTTP without redirecting to "
+                        "HTTPS. Retrieval systems downrank or refuse insecure "
+                        "duplicates of pages.",
+            fix="Add a permanent 301 redirect from http:// to https:// at the "
+                "server or CDN level.")
+
+    hrefs = [a.get("href", "") for a in home.find_all("a", href=True)]
+    hrefs_l = [h.lower() for h in hrefs]
+
+    # --- legal & policy pages
+    has_privacy = any("privacy" in h for h in hrefs_l)
+    has_terms = any(("terms" in h or "conditions" in h) for h in hrefs_l)
+    make_check(
+        checks, "Entity & Trust", "Legal & policy pages",
+        ok=(has_privacy and has_terms), max_points=3,
+        detail_pass="Privacy policy and terms pages are linked.",
+        detail_fail=("Missing " +
+                     " and ".join([x for x, ok in
+                                   [("a privacy policy link", has_privacy),
+                                    ("a terms/conditions link", has_terms)]
+                                   if not ok]) +
+                     ". These are baseline legitimacy signals for a real business."),
+        fix="Publish privacy and terms pages and link them from the footer.",
+        warn=(has_privacy or has_terms))
+
+    # --- social profiles linked
+    SOCIAL = ("facebook.com", "linkedin.com", "youtube.com", "instagram.com",
+              "x.com", "twitter.com", "tiktok.com")
+    found = sorted({d.split(".")[0] for h in hrefs_l for d in SOCIAL if d in h})
+    make_check(
+        checks, "Entity & Trust", "Social profiles linked",
+        ok=(len(found) >= 2), max_points=3,
+        detail_pass=f"Social profiles linked: {', '.join(found)}.",
+        detail_fail=("Only " + ", ".join(found) + " linked."
+                     if found else
+                     "No social profile links found. Cross-platform presence is "
+                     "how AI corroborates the business as a real entity."),
+        fix="Link the business's real social profiles (Facebook, LinkedIn, "
+            "YouTube) from the site footer, and add them to the Organization "
+            "schema sameAs array.",
+        warn=(len(found) == 1))
+
+    # --- local signals: city named + map present
+    city = ""
+    for s in soups:
+        if s is None:
+            continue
+        for tag in s.find_all("script", type="application/ld+json"):
+            m = re.search(r'"addressLocality"\s*:\s*"([^"]+)"',
+                          tag.string or "")
+            if m:
+                city = m.group(1).strip()
+                break
+        if city:
+            break
+    title = (home.title.get_text(strip=True) if home.title else "")
+    h1 = home.find("h1")
+    h1_text = h1.get_text(" ", strip=True) if h1 else ""
+    has_map = bool(home.find("iframe", src=re.compile(r"google\.[^/]*/maps", re.I))) \
+        or any("google" in h and "maps" in h for h in hrefs_l)
+    if city:
+        city_named = city.lower() in (title + " " + h1_text).lower()
+        make_check(
+            checks, "Entity & Trust", "Local signals (city + map)",
+            ok=(city_named and has_map), max_points=4,
+            detail_pass=f'The city ("{city}") appears in the title/H1 and a '
+                        "Google Maps embed/link is present.",
+            detail_fail=("; ".join(filter(None, [
+                None if city_named else
+                f'the schema city ("{city}") does not appear in the page '
+                "title or H1",
+                None if has_map else "no Google Maps embed or link found",
+            ])).capitalize() + "."),
+            fix="Name the primary city in the homepage title and H1, and embed "
+                "the Google Maps listing - both anchor the business to its "
+                "location for local AI answers.",
+            warn=(city_named or has_map))
+    data["local_city"] = city
+
 
 def check_originality(soups, checks, data):
     """Deterministic template/duplication analysis across the sampled pages.
@@ -1263,7 +1443,7 @@ def check_ai_judgment(base, soups, checks, data, llm_cfg):
     checks[-1].points = len(covered)
 
 
-def run_audit(url, brand, max_pages, out_base, deep_llm=None):
+def run_audit(url, brand, max_pages, out_base, deep_llm=None, manual=None):
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     parsed = urlparse(url)
@@ -1294,6 +1474,7 @@ def run_audit(url, brand, max_pages, out_base, deep_llm=None):
     check_structured_data(soups, checks, data)
     check_content(soups, [base] + pages, checks, data)
     check_entity(base, soups, session, checks, data)
+    check_site_basics(base, soups, session, checks, data)
     check_originality(soups, checks, data)
     if deep_llm:
         check_ai_judgment(base, soups, checks, data, deep_llm)
@@ -1308,18 +1489,22 @@ def run_audit(url, brand, max_pages, out_base, deep_llm=None):
     # Two versions:
     #   <base>.html / .pdf         -> internal working copy, includes fixes
     #   <base>-client.html / .pdf  -> client copy, findings only
-    html = build_html(parsed.netloc, brand, checks, data, internal=True)
+    import manual_audit as MA
+    manual_items = manual or MA.merged({})
+    html = build_html(parsed.netloc, brand, checks, data, internal=True,
+                      manual=manual_items)
     with open(f"{out_base}.html", "w", encoding="utf-8") as f:
         f.write(html)
     print(f"  wrote {out_base}.html (internal)")
 
-    client_html = build_html(parsed.netloc, brand, checks, data, internal=False)
+    client_html = build_html(parsed.netloc, brand, checks, data, internal=False,
+                             manual=manual_items)
     with open(f"{out_base}-client.html", "w", encoding="utf-8") as f:
         f.write(client_html)
     print(f"  wrote {out_base}-client.html (client)")
 
     guide_html = build_html(parsed.netloc, brand, checks, data,
-                            internal=False, guide=True)
+                            internal=False, guide=True, manual=manual_items)
     with open(f"{out_base}-guide.html", "w", encoding="utf-8") as f:
         f.write(guide_html)
     print(f"  wrote {out_base}-guide.html (remediation guide)")

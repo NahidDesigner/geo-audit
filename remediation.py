@@ -677,6 +677,59 @@ GUIDES = {
              "measurement - the deterministic checks are the stable baseline."),
 ],
 
+"HTTPS enforced": [
+    ("p", "The site answers on plain HTTP without redirecting. Every page then exists "
+          "twice - a secure and an insecure copy - and retrieval systems downrank or "
+          "refuse the insecure one."),
+    ("ol", [
+        "If the site is behind Cloudflare: <b>SSL/TLS &rarr; Edge Certificates &rarr; "
+        "Always Use HTTPS</b> - turn it ON.",
+        "Otherwise add a permanent 301 redirect at the web server, or enable "
+        "'Force HTTPS' in the hosting panel.",
+        "Verify: open <code>http://{domain}/</code> - the browser must land on "
+        "<code>https://</code>.",
+    ]),
+],
+
+"Legal & policy pages": [
+    ("p", "Privacy and terms pages are baseline legitimacy signals - their absence is "
+          "one of the patterns thin or fake sites share."),
+    ("ol", [
+        "Publish a privacy policy and a terms page (WordPress ships a privacy page "
+        "template under <b>Settings &rarr; Privacy</b>).",
+        "Link both from the site footer so they appear site-wide.",
+        "Make the privacy page honest for the tools actually in use (analytics, "
+        "forms, chat widgets).",
+    ]),
+],
+
+"Social profiles linked": [
+    ("p", "Cross-platform presence is how AI corroborates that a business is real. A "
+          "site that links no profiles looks isolated even when profiles exist."),
+    ("ol", [
+        "Link the real profiles (Facebook, LinkedIn, YouTube, Instagram) from the "
+        "footer.",
+        "Add every profile URL to the <code>sameAs</code> array in the Organization "
+        "schema - the machine-readable version of the same signal.",
+        "Skip platforms the business does not actually use - a dead link is worse "
+        "than no link.",
+    ]),
+],
+
+"Local signals (city + map)": [
+    ("p", "Local AI answers anchor on an unambiguous location. A page targeting a city "
+          "that never names it in the title or H1, and shows no map, gives the engine "
+          "nothing to anchor to."),
+    ("ol", [
+        "Put the primary city in the homepage title tag and H1 (e.g. 'Personal "
+        "Injury Lawyers in Denver, CO').",
+        "Embed the Google Maps listing on the contact page or footer: in Google "
+        "Maps, Share &rarr; Embed a map &rarr; copy the iframe into an HTML widget.",
+        "Make sure the city in the visible text matches <code>addressLocality</code> "
+        "in the schema exactly.",
+    ]),
+],
+
 "Customer-question coverage (LLM judge)": [
     ("p", "People ask AI assistants practical questions: what does this business do, "
           "where, what does it cost, how long does it take, is it right for me. The "

@@ -11,7 +11,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py geo_audit.py prospects.py remediation.py mcp_server.py deep_scan.py ./
+COPY app.py geo_audit.py prospects.py remediation.py mcp_server.py deep_scan.py manual_audit.py ./
 
 # Reports + database live here - mount a Coolify volume at this path
 ENV GEO_DATA_DIR=/app/data

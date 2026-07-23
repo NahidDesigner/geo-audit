@@ -133,6 +133,14 @@ def init_db():
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ptest_client "
                      "ON presence_tests(client_id, engine, prompt)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS manual_results (
+            audit_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            status TEXT NOT NULL,          -- pass | warn | fail
+            notes TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (audit_id, key)
+        )""")
 
 
 init_db()
@@ -642,6 +650,89 @@ def aitests_delete(tid):
     with _db_lock, db() as conn:
         conn.execute("DELETE FROM presence_tests WHERE id=?", (tid,))
     return redirect(request.referrer or url_for("aitests_page"))
+
+
+# ---------------------------------------------------------------------------
+# Manual checks per audit (off-site verification) + report re-render
+# ---------------------------------------------------------------------------
+import manual_audit as MA
+
+
+def _manual_items(audit_id):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM manual_results WHERE audit_id=?",
+                            (audit_id,)).fetchall()
+    return MA.merged({r["key"]: r for r in rows})
+
+
+def re_render_reports(audit_id):
+    """Rebuild the three HTML/PDF variants from the stored audit JSON plus the
+    current manual results. The automatic score is untouched."""
+    from geo_audit import Check, build_html
+    p = os.path.join(REPORT_DIR, f"{audit_id}.json")
+    if not os.path.exists(p):
+        return False
+    with open(p, encoding="utf-8") as f:
+        raw = json.load(f)
+    checks = [Check(**{k: c.get(k) for k in
+                       ("category", "name", "status", "points", "max_points",
+                        "detail", "fix", "impact", "why")})
+              for c in raw["checks"]]
+    with db() as conn:
+        row = conn.execute("SELECT url, brand FROM audits WHERE id=?",
+                           (audit_id,)).fetchone()
+    if not row:
+        return False
+    site = urlparse(row["url"]).netloc
+    manual = _manual_items(audit_id)
+    base = os.path.join(REPORT_DIR, str(audit_id))
+    variants = [(f"{base}.html", dict(internal=True)),
+                (f"{base}-client.html", dict(internal=False)),
+                (f"{base}-guide.html", dict(internal=False, guide=True))]
+    for path, kw in variants:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(build_html(site, row["brand"], checks, raw["data"],
+                               manual=manual, **kw))
+    try:
+        from weasyprint import HTML
+        for path, _ in variants:
+            HTML(filename=path).write_pdf(path.replace(".html", ".pdf"))
+    except Exception:
+        traceback.print_exc()
+    return True
+
+
+@app.route("/audit/<int:audit_id>/manual", methods=["GET", "POST"])
+@login_required
+def manual_page(audit_id):
+    with db() as conn:
+        a = conn.execute("SELECT * FROM audits WHERE id=?", (audit_id,)).fetchone()
+    if not a or a["status"] != "done":
+        abort(404)
+    msg = ""
+    if request.method == "POST":
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        with _db_lock, db() as conn:
+            for key in MA.CATALOG:
+                status = request.form.get(f"status-{key}", "")
+                notes = (request.form.get(f"notes-{key}") or "").strip()
+                if status in ("pass", "warn", "fail"):
+                    conn.execute(
+                        "INSERT INTO manual_results (audit_id,key,status,notes,"
+                        "updated_at) VALUES (?,?,?,?,?) "
+                        "ON CONFLICT(audit_id,key) DO UPDATE SET status=excluded.status, "
+                        "notes=excluded.notes, updated_at=excluded.updated_at",
+                        (audit_id, key, status, notes or None, now))
+                elif status == "clear":
+                    conn.execute("DELETE FROM manual_results WHERE audit_id=? "
+                                 "AND key=?", (audit_id, key))
+        re_render_reports(audit_id)
+        msg = "Saved - reports regenerated with the manual results."
+    items = _manual_items(audit_id)
+    e_earn, e_max = MA.extended_score(items)
+    return render_template_string(MANUAL_TMPL, a=a, items=items, msg=msg,
+                                  e_earn=e_earn, e_max=e_max,
+                                  site=urlparse(a["url"]).netloc)
 
 
 # ----------------------------------------------------------------------------
@@ -1702,6 +1793,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
           <th>Internal <span style="text-transform:none;letter-spacing:0">(with fixes)</span></th>
           <th>Client <span style="text-transform:none;letter-spacing:0">(findings only)</span></th>
           <th>Guide <span style="text-transform:none;letter-spacing:0">(sellable)</span></th>
+          <th>Off-site</th>
           <th></th></tr>
       {% for r in rows %}
       <tr>
@@ -1751,6 +1843,11 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
             {% if r['pdf'] %}<a href="{{ url_for('pdf', audit_id=r['id'], variant='guide') }}">PDF</a>{% endif %}
           {% endif %}
         </td>
+        <td class="links">
+          {% if r['status']=='done' %}
+            <a href="{{ url_for('manual_page', audit_id=r['id']) }}" style="color:#0f766e;background:#f0fdfa;border:1px solid #99f6e4">Manual</a>
+          {% endif %}
+        </td>
         <td style="text-align:right">
           <form method="post" action="{{ url_for('delete', audit_id=r['id']) }}"
                 onsubmit="return confirm('Delete this audit?')" style="margin:0">
@@ -1759,7 +1856,7 @@ INDEX_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
         </td>
       </tr>
       {% endfor %}
-      {% if not rows %}<tr><td colspan="9" style="color:#94a3b8">
+      {% if not rows %}<tr><td colspan="10" style="color:#94a3b8">
         No audits yet. Enter a URL above and click Run Audit.</td></tr>{% endif %}
     </table>
   </div>
@@ -2295,6 +2392,70 @@ AITESTS_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
       </ol>
     </details>
   </div>
+</div></body></html>"""
+
+
+MANUAL_TMPL = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Manual checks - {{ site }}</title>
+<style>""" + BASE_CSS + """
+  .mi { border:1px solid #e2e8f0; border-radius:9px; padding:14px 16px; margin-bottom:11px; }
+  .mi-head { display:flex; align-items:center; gap:9px; margin-bottom:5px; }
+  .mi-head h3 { margin:0; font-size:14px; }
+  .impact { font-size:8.5px; font-weight:800; letter-spacing:.8px; padding:2px 7px;
+            border-radius:20px; border:1px solid; white-space:nowrap; }
+  .why { color:#64748b; font-size:12.5px; margin-bottom:8px; }
+  details { margin-bottom:9px; }
+  details summary { cursor:pointer; color:#1d4ed8; font-size:12px; font-weight:700; }
+  details ol { margin:8px 0 2px; padding-left:20px; font-size:12.5px; color:#334155; }
+  details li { margin-bottom:4px; }
+  .msg { background:#f0fdf4; border:1px solid #bbf7d0; color:#15803d;
+         border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:13px; }
+  .mrow { display:flex; gap:10px; }
+  .mrow select { flex:0 0 210px; }
+  .mrow input { flex:1; }
+</style></head><body>
+<div class="topbar"><div class="wrap">
+  <h1>Off-site checks &mdash; {{ site }}</h1>
+  <a href="{{ url_for('index') }}">&larr; Back to audits</a>
+</div></div>
+<div class="wrap">
+  {% if msg %}<div class="msg">{{ msg }}</div>{% endif %}
+  <div class="ctx">These are the topics no crawler can verify - profiles, reviews,
+    mentions. Follow the steps, pick a verdict, note what you found. Saving
+    <b>regenerates all three reports</b>: results appear in the internal and client
+    copies{% if e_max %} (extended score currently <b>{{ e_earn }}/{{ e_max }}</b>){% endif %};
+    anything left unverified shows in the client copy as a locked
+    &ldquo;full audit&rdquo; item &mdash; your upsell.</div>
+  <form method="post">
+    {% for m in items %}
+    {% set imp = {'critical':('#dc2626','#fef2f2'),'high':('#ea580c','#fff7ed'),
+                  'medium':('#d97706','#fffbeb'),'low':('#64748b','#f8fafc')}[m['impact']] %}
+    <div class="mi">
+      <div class="mi-head">
+        <span class="impact" style="color:{{ imp[0] }};background:{{ imp[1] }};border-color:{{ imp[0] }}40">{{ m['impact']|upper }}</span>
+        <h3>{{ m['name'] }}</h3>
+        <span style="color:#94a3b8;font-size:12px;margin-left:auto">{{ m['max_points'] }} pts</span>
+      </div>
+      <div class="why">{{ m['why'] }}</div>
+      <details><summary>How to verify - step by step</summary>
+        <ol>{% for s in m['how'] %}<li>{{ s|safe }}</li>{% endfor %}</ol>
+      </details>
+      <div class="mrow">
+        <select name="status-{{ m['key'] }}">
+          <option value="">&mdash; not verified &mdash;</option>
+          <option value="pass" {{ 'selected' if m['status']=='pass' }}>Pass</option>
+          <option value="warn" {{ 'selected' if m['status']=='warn' }}>Needs work</option>
+          <option value="fail" {{ 'selected' if m['status']=='fail' }}>Fail</option>
+          {% if m['status'] %}<option value="clear">Clear this result</option>{% endif %}
+        </select>
+        <input type="text" name="notes-{{ m['key'] }}" value="{{ m['notes'] }}"
+               placeholder="What you found (goes into the report)">
+      </div>
+    </div>
+    {% endfor %}
+    <button type="submit">Save &amp; regenerate reports</button>
+  </form>
 </div></body></html>"""
 
 
